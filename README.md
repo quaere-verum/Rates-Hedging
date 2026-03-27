@@ -85,7 +85,7 @@ The experiment is computationally heavy because it repeatedly recalibrates HW an
 The experiment uses:
 
 - an outer LIBOR Market Model to generate the yield-curve trajectory
-- a semi-realistic ATM swaption-surface trajectory linked to the outer market path
+- an LMM-implied ATM swaption-surface trajectory generated from the same outer forward-rate state
 - an inner Monte Carlo pricing loop in which the desk recalibrates either Hull-White or G2++ at every hedge date
 - two hedge sets on the exact same outer market paths:
   - delta-only
@@ -105,13 +105,23 @@ Generated files:
 - `artifacts/lmm_outer_hedging_comparison_time.csv`
 - `artifacts/lmm_outer_hedging_comparison_risk.csv`
 
+### Resulting Plots
+
+Overview of the final PnL distributions and headline risk metrics:
+
+![LMM Outer Hedging Overview](artifacts/lmm_outer_hedging_comparison_overview.png)
+
+Mean cumulative PnL breakdown across hedge dates:
+
+![LMM Outer Hedging Breakdown](artifacts/lmm_outer_hedging_comparison_breakdown.png)
+
 ## Current Takeaways
 
 From the current generated artifacts:
 
 - delta+vega hedging improves the mean PnL, standard deviation, and 95% VaR for both desk models relative to delta-only hedging on the same LMM paths
 - G2++ fits the outer market surface more closely than Hull-White, reflected in lower calibration RMSE
-- the HW and G2++ hedge outcomes are reasonably close under the LMM outer market, which is plausible because neither desk model is the true outer model
+- under the current true-LMM ATM surface setup, G2++ outperforms Hull-White on the main mean / dispersion / 95% tail metrics for both hedge sets
 - the experiment outputs enough diagnostics to separate calibration quality, residual curve risk, residual vega risk, and PnL decomposition effects
 
 ## Notes on Modeling Choices
