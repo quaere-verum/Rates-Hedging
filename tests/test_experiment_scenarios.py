@@ -25,7 +25,9 @@ class ExperimentScenarioTests(unittest.TestCase):
         self.assertEqual(scenarios[0].real_dynamics, "G2++")
         self.assertEqual(scenarios[1].real_dynamics, "G2++")
         self.assertIsNotNone(scenarios[0].outer_paths)
+        self.assertIsNotNone(scenarios[0].outer_surface_paths)
         self.assertIs(scenarios[0].outer_paths, scenarios[1].outer_paths)
+        self.assertIs(scenarios[0].outer_surface_paths, scenarios[1].outer_surface_paths)
         np.testing.assert_allclose(scenarios[0].outer_paths.time, config.time_grid)
         np.testing.assert_allclose(scenarios[0].outer_paths.yield_curve_tenors, config.yield_curve_tenors)
 
@@ -45,6 +47,8 @@ class ExperimentScenarioTests(unittest.TestCase):
         self.assertEqual(path_summary.shape[0], 4)
         self.assertEqual(set(time_summary["model"]), {scenario.label for scenario in scenarios})
         self.assertEqual(set(risk_summary["pricing_model"]), {"Hull-White", "G2++"})
+        self.assertIn("mean_calibration_rmse", path_summary.columns)
+        self.assertIn("calibration_rmse", time_summary.columns)
 
 
 if __name__ == "__main__":

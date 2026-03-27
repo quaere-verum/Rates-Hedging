@@ -5,9 +5,11 @@
 The repository currently focuses on:
 
 - Gaussian short-rate models: Hull-White and G2++
+- Calibration of model vol parameters to ATM European swaption surfaces
 - Interest-rate instruments: swaps, European swaptions, Bermudan swaptions
 - Monte Carlo pricing with Longstaff-Schwartz regression for Bermudan exercise
 - Pathwise hedging with curve-delta and optional model-vega hedging
+- Snapshot-by-snapshot recalibration to yield-curve and swaption-surface trajectories
 - Reproducible experiments that compare hedge PnL across models and hedge sets
 
 ## Repository Overview
@@ -28,9 +30,11 @@ The main code lives in `src/rateshedging/`:
   - `exercise_strategy.py`: abstract base class for exercise strategies
   - `regression.py`: Longstaff-Schwartz regression framework
   - `engine.py`: Monte Carlo pricing engine
+- `calibration/`
+  - `swaption_surface.py`: ATM swaption-surface containers, proxy normal-vol formulas, and surface-path utilities
 - `hedging/`
-  - `model_adapters.py`: typed model rebuilders and volatility-bump definitions for vega hedging
-  - `engine.py`: dynamic hedging engine with PnL breakdown and residual-risk tracking
+  - `model_adapters.py`: typed model rebuilders, swaption-surface calibration hooks, and volatility-bump definitions for vega hedging
+  - `engine.py`: dynamic hedging engine with PnL breakdown, residual-risk tracking, and per-snapshot recalibration
 
 Supporting directories:
 
@@ -160,7 +164,9 @@ From the current generated artifacts:
 ## Notes on Modeling Choices
 
 - Yield-curve inputs and outputs use simple continuously compounded zero rates.
+- Calibration uses ATM European swaption normal-vol surfaces on a small expiry/tenor grid.
+- Mean-reversion and correlation are treated as structural inputs; the calibration step fits the model volatility parameters to the surface at each hedge date.
 - Bermudan pricing uses Monte Carlo simulation with Longstaff-Schwartz continuation-value regression.
-- The hedging engine reboots the model from each curve snapshot so option pricing stays consistent with the current term structure.
+- The hedging engine reboots and recalibrates the model from each curve-plus-surface snapshot so option pricing stays consistent with the current market state.
 - Vega hedging is model-parameter vega, not an implied-vol surface hedge.
 - Realized swap coupon carry is booked when the rebalance grid matches the coupon accrual grid.

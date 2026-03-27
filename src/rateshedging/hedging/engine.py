@@ -6,6 +6,7 @@ from typing import Callable, Sequence
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from rateshedging.calibration.swaption_surface import SwaptionSurfaceTrajectory
 from rateshedging.hedging.model_adapters import InterestRateModelAdapter
 from rateshedging.instruments.bermudan_swaption import BermudanSwaption
 from rateshedging.instruments.instrument import InterestRateInstrument
@@ -26,6 +27,10 @@ class HedgingResult:
     key_rate_tenors: FloatArray
     vega_labels: tuple[str, ...]
     vega_bump_sizes: FloatArray
+    calibrated_parameter_names: tuple[str, ...]
+    calibrated_parameters: FloatArray
+    calibration_rmse: FloatArray
+    calibration_max_abs_error: FloatArray
     target_values: FloatArray
     hedge_values: FloatArray
     hedge_weights: FloatArray
@@ -82,6 +87,7 @@ class DynamicHedgingEngine:
         yield_curve_tenors: ArrayLike,
         target_instrument: InterestRateInstrument,
         hedging_instruments: Sequence[InterestRateInstrument],
+        swaption_surface_trajectory: SwaptionSurfaceTrajectory | None = None,
     ) -> HedgingResult:
         curve_path = np.asarray(yield_curve_trajectory, dtype=np.float64)
         times = np.asarray(time_grid, dtype=np.float64)
@@ -91,6 +97,13 @@ class DynamicHedgingEngine:
             raise ValueError("yield_curve_trajectory must be a two-dimensional array.")
         if curve_path.shape != (times.size, tenors.size):
             raise ValueError("yield_curve_trajectory shape must match time_grid and yield_curve_tenors.")
+        if swaption_surface_trajectory is not None and not np.allclose(
+            swaption_surface_trajectory.time_grid,
+            times,
+            atol=1.0e-12,
+            rtol=0.0,
+        ):
+            raise ValueError("swaption_surface_trajectory time_grid must match time_grid.")
 
         vega_parameters = self.model_adapter.vega_parameters if self.include_vega and self.model_adapter else ()
         if self.include_vega and self.model_adapter is None:
@@ -98,12 +111,17 @@ class DynamicHedgingEngine:
 
         vega_labels = tuple(parameter.name for parameter in vega_parameters)
         vega_bump_sizes = np.asarray([parameter.bump_size for parameter in vega_parameters], dtype=np.float64)
+        calibrated_parameter_names = self.model_adapter.calibration_parameter_names if self.model_adapter else ()
 
         n_times = times.size
         n_hedges = len(hedging_instruments)
         n_vega = len(vega_parameters)
+        n_calibration_parameters = len(calibrated_parameter_names)
         hedging_instruments = list(hedging_instruments)
 
+        calibrated_parameters = np.zeros((n_times, n_calibration_parameters), dtype=np.float64)
+        calibration_rmse = np.zeros(n_times, dtype=np.float64)
+        calibration_max_abs_error = np.zeros(n_times, dtype=np.float64)
         target_values = np.zeros(n_times, dtype=np.float64)
         hedge_values = np.zeros((n_times, n_hedges), dtype=np.float64)
         hedge_weights = np.zeros((n_times, n_hedges), dtype=np.float64)
@@ -135,6 +153,19 @@ class DynamicHedgingEngine:
 
         for time_index, valuation_time in enumerate(times):
             current_curve = CurveSnapshot.from_zero_rates(tenors, curve_path[time_index])
+            active_model_adapter = self.model_adapter
+            if self.model_adapter is not None and swaption_surface_trajectory is not None:
+                calibration = self.model_adapter.calibrate(
+                    valuation_time,
+                    current_curve,
+                    swaption_surface_trajectory.snapshot(time_index),
+                )
+                active_model_adapter = calibration.adapter
+                calibrated_parameters[time_index] = calibration.parameter_values
+                calibration_rmse[time_index] = calibration.rmse
+                calibration_max_abs_error[time_index] = calibration.max_abs_error
+            elif active_model_adapter is not None and n_calibration_parameters > 0:
+                calibrated_parameters[time_index] = active_model_adapter.calibration_parameter_values
 
             target_swap_cashflow = 0.0
             hedge_swap_cashflows = np.zeros(n_hedges, dtype=np.float64)
@@ -176,6 +207,7 @@ class DynamicHedgingEngine:
                 tenors,
                 valuation_time,
                 target_active,
+                active_model_adapter,
             )
             if n_hedges == 0:
                 provisional_hedge_values = np.zeros(0, dtype=np.float64)
@@ -189,6 +221,7 @@ class DynamicHedgingEngine:
                             tenors,
                             valuation_time,
                             active,
+                            active_model_adapter,
                         )
                         for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
                     ],
@@ -254,6 +287,7 @@ class DynamicHedgingEngine:
                 tenors,
                 valuation_time,
                 target_active,
+                active_model_adapter,
             )
             if n_hedges == 0:
                 hedge_sensitivities = np.zeros((0, tenors.size), dtype=np.float64)
@@ -266,6 +300,7 @@ class DynamicHedgingEngine:
                             tenors,
                             valuation_time,
                             bool(active),
+                            active_model_adapter,
                         )
                         for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
                     ],
@@ -279,6 +314,7 @@ class DynamicHedgingEngine:
                 valuation_time,
                 target_active,
                 vega_parameters,
+                active_model_adapter,
             )
             if n_hedges == 0:
                 hedge_vegas = np.zeros((0, n_vega), dtype=np.float64)
@@ -292,6 +328,7 @@ class DynamicHedgingEngine:
                             valuation_time,
                             bool(active),
                             vega_parameters,
+                            active_model_adapter,
                         )
                         for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
                     ],
@@ -355,6 +392,10 @@ class DynamicHedgingEngine:
             key_rate_tenors=tenors.copy(),
             vega_labels=vega_labels,
             vega_bump_sizes=vega_bump_sizes.copy(),
+            calibrated_parameter_names=calibrated_parameter_names,
+            calibrated_parameters=calibrated_parameters,
+            calibration_rmse=calibration_rmse,
+            calibration_max_abs_error=calibration_max_abs_error,
             target_values=target_values,
             hedge_values=hedge_values,
             hedge_weights=hedge_weights,
@@ -384,6 +425,7 @@ class DynamicHedgingEngine:
         curve_tenors: FloatArray,
         valuation_time: float,
         is_active: bool,
+        model_adapter: InterestRateModelAdapter | None,
     ) -> float:
         if not is_active:
             return 0.0
@@ -391,6 +433,7 @@ class DynamicHedgingEngine:
         model = None
         if local_time_grid is not None:
             model = self._build_model_from_inputs(
+                model_adapter,
                 valuation_time,
                 local_time_grid,
                 curve_tenors,
@@ -414,13 +457,14 @@ class DynamicHedgingEngine:
 
     def _build_model_from_inputs(
         self,
+        model_adapter: InterestRateModelAdapter | None,
         valuation_time: float,
         local_time_grid: FloatArray,
         curve_tenors: FloatArray,
         discount_factors: FloatArray,
     ) -> InterestRateModel:
-        if self.model_adapter is not None:
-            return self.model_adapter.build(
+        if model_adapter is not None:
+            return model_adapter.build(
                 valuation_time,
                 local_time_grid,
                 curve_tenors,
@@ -439,6 +483,7 @@ class DynamicHedgingEngine:
 
     def _build_bumped_model(
         self,
+        model_adapter: InterestRateModelAdapter | None,
         parameter_name: str,
         parameter_shift: float,
         valuation_time: float,
@@ -446,9 +491,9 @@ class DynamicHedgingEngine:
         curve_tenors: FloatArray,
         discount_factors: FloatArray,
     ) -> InterestRateModel:
-        if self.model_adapter is None:
+        if model_adapter is None:
             raise ValueError("A model_adapter is required to compute vega sensitivities.")
-        return self.model_adapter.build_with_parameter_shift(
+        return model_adapter.build_with_parameter_shift(
             parameter_name,
             parameter_shift,
             valuation_time,
@@ -533,6 +578,7 @@ class DynamicHedgingEngine:
         curve_tenors: FloatArray,
         valuation_time: float,
         is_active: bool,
+        model_adapter: InterestRateModelAdapter | None,
     ) -> FloatArray:
         if not is_active:
             return np.zeros(curve_tenors.size, dtype=np.float64)
@@ -567,12 +613,14 @@ class DynamicHedgingEngine:
             discount_factors_up = zero_rates_to_discount_factors(bumped_up, curve_tenors)
             discount_factors_down = zero_rates_to_discount_factors(bumped_down, curve_tenors)
             model_up = self._build_model_from_inputs(
+                model_adapter,
                 valuation_time,
                 local_time_grid,
                 curve_tenors,
                 discount_factors_up,
             )
             model_down = self._build_model_from_inputs(
+                model_adapter,
                 valuation_time,
                 local_time_grid,
                 curve_tenors,
@@ -592,6 +640,7 @@ class DynamicHedgingEngine:
         valuation_time: float,
         is_active: bool,
         vega_parameters: tuple,
+        model_adapter: InterestRateModelAdapter | None,
     ) -> FloatArray:
         if not is_active or len(vega_parameters) == 0:
             return np.zeros(len(vega_parameters), dtype=np.float64)
@@ -607,6 +656,7 @@ class DynamicHedgingEngine:
         vegas = np.empty(len(vega_parameters), dtype=np.float64)
         for parameter_index, parameter in enumerate(vega_parameters):
             model_up = self._build_bumped_model(
+                model_adapter,
                 parameter.name,
                 parameter.bump_size,
                 valuation_time,
@@ -615,6 +665,7 @@ class DynamicHedgingEngine:
                 discount_factors,
             )
             model_down = self._build_bumped_model(
+                model_adapter,
                 parameter.name,
                 -parameter.bump_size,
                 valuation_time,
