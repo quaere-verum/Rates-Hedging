@@ -67,6 +67,7 @@ This executes:
 1. `experiments/compare_bermudan_hedging.py`
 2. `experiments/bermudan_delta_pnl_breakdown.py`
 3. `experiments/bermudan_delta_vega_pnl_breakdown.py`
+4. `experiments/bermudan_model_misspecification_pnl_breakdown.py`
 
 Each script writes plots and CSV summaries into `artifacts/`.
 
@@ -130,6 +131,22 @@ Generated files:
 - `artifacts/bermudan_delta_vega_pnl_breakdown_risk.csv`
 
 ![Delta + vega hedging PnL breakdown](artifacts/bermudan_delta_vega_pnl_breakdown.png)
+
+### 4. Model Misspecification: Hull-White Pricing on G2++ Dynamics
+
+`experiments/bermudan_model_misspecification_pnl_breakdown.py` fixes the realized market dynamics to G2++ paths and compares two desks on the exact same outer scenarios:
+
+- a misspecified desk that prices and hedges with Hull-White
+- a correctly specified desk that prices and hedges with G2++
+
+The script keeps the hedge set delta-only so the comparison isolates model misspecification rather than differences in model-vega parameterization. It writes the same pathwise PnL decomposition and risk summaries as the other breakdown studies.
+
+Generated files:
+
+- `artifacts/bermudan_model_misspecification_pnl_breakdown.png`
+- `artifacts/bermudan_model_misspecification_pnl_breakdown_paths.csv`
+- `artifacts/bermudan_model_misspecification_pnl_breakdown_time.csv`
+- `artifacts/bermudan_model_misspecification_pnl_breakdown_risk.csv`
 
 ## Current Takeaways
 

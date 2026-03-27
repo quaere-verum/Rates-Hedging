@@ -18,7 +18,7 @@ from rateshedging.instruments.swap import Swap
 from rateshedging.instruments.swaption import Swaption
 from rateshedging.models.g2pp import G2PPModel
 from rateshedging.models.hull_white import HullWhiteModel
-from rateshedging.models.model import InterestRateModel
+from rateshedging.models.model import InterestRateModel, RatePaths
 from rateshedging.pricing.engine import MonteCarloPricingEngine
 
 
@@ -52,8 +52,15 @@ class ExperimentConfig:
 @dataclass(frozen=True)
 class Scenario:
     label: str
-    outer_model: InterestRateModel
     model_adapter: InterestRateModelAdapter
+    outer_model: InterestRateModel | None = None
+    outer_paths: RatePaths | None = None
+    pricing_model: str | None = None
+    real_dynamics: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.outer_model is None and self.outer_paths is None:
+            raise ValueError("A scenario requires either an outer_model or pre-generated outer_paths.")
 
 
 def default_config() -> ExperimentConfig:
@@ -185,17 +192,18 @@ def build_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
     return (
         Scenario(
             label="Hull-White",
-            outer_model=hull_white_outer,
             model_adapter=HullWhiteModelAdapter(
                 mean_reversion=0.08,
                 volatility=0.01,
                 seed=config.pricing_seed_hw,
                 volatility_bump=5.0e-4,
             ),
+            outer_model=hull_white_outer,
+            pricing_model="Hull-White",
+            real_dynamics="Hull-White",
         ),
         Scenario(
             label="G2++",
-            outer_model=g2pp_outer,
             model_adapter=G2PPModelAdapter(
                 mean_reversion_x=0.15,
                 mean_reversion_y=0.03,
@@ -206,6 +214,56 @@ def build_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
                 volatility_x_bump=5.0e-4,
                 volatility_y_bump=5.0e-4,
             ),
+            outer_model=g2pp_outer,
+            pricing_model="G2++",
+            real_dynamics="G2++",
+        ),
+    )
+
+
+def build_g2pp_misspecification_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
+    g2pp_outer = G2PPModel(
+        mean_reversion_x=0.15,
+        mean_reversion_y=0.03,
+        volatility_x=0.010,
+        volatility_y=0.006,
+        correlation=-0.70,
+        time_grid=config.time_grid,
+        curve_times=config.curve_times,
+        discount_factors=config.discount_factors,
+        yield_curve_tenors=config.yield_curve_tenors,
+        seed=config.g2_seed,
+    )
+    shared_outer_paths = g2pp_outer.generate_paths(config.n_outer_paths)
+
+    return (
+        Scenario(
+            label="HW Pricing / G2++ Dynamics",
+            model_adapter=HullWhiteModelAdapter(
+                mean_reversion=0.08,
+                volatility=0.01,
+                seed=config.pricing_seed_hw,
+                volatility_bump=5.0e-4,
+            ),
+            outer_paths=shared_outer_paths,
+            pricing_model="Hull-White",
+            real_dynamics="G2++",
+        ),
+        Scenario(
+            label="G2++ Pricing / G2++ Dynamics",
+            model_adapter=G2PPModelAdapter(
+                mean_reversion_x=0.15,
+                mean_reversion_y=0.03,
+                volatility_x=0.010,
+                volatility_y=0.006,
+                correlation=-0.70,
+                seed=config.pricing_seed_g2,
+                volatility_x_bump=5.0e-4,
+                volatility_y_bump=5.0e-4,
+            ),
+            outer_paths=shared_outer_paths,
+            pricing_model="G2++",
+            real_dynamics="G2++",
         ),
     )
 
@@ -222,13 +280,16 @@ def _loss_cvar(values: FloatArray, confidence: float) -> float:
 
 def summarize_risk_metrics(path_summary: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
+    metadata_columns = [column for column in ("pricing_model", "real_dynamics") if column in path_summary.columns]
     for model_label in sorted(path_summary["model"].unique()):
         model_rows = path_summary[path_summary["model"] == model_label]
+        metadata = {column: str(model_rows[column].iloc[0]) for column in metadata_columns}
         for quantity in RISK_QUANTITIES:
             values = model_rows[quantity].to_numpy(dtype=np.float64)
             rows.append(
                 {
                     "model": model_label,
+                    **metadata,
                     "quantity": quantity,
                     "mean": float(np.mean(values)),
                     "std": float(np.std(values, ddof=1)),
@@ -275,6 +336,8 @@ def _path_summary_row(
 
     row: dict[str, float | str | int] = {
         "model": scenario.label,
+        "pricing_model": scenario.pricing_model or scenario.label,
+        "real_dynamics": scenario.real_dynamics or scenario.label,
         "strategy": strategy_label,
         "path": path_index,
         "final_pnl": float(result.portfolio_value[-1]),
@@ -301,6 +364,8 @@ def _time_profile_rows(
     for time_index, time_value in enumerate(result.time):
         row: dict[str, float | str | int] = {
             "model": scenario.label,
+            "pricing_model": scenario.pricing_model or scenario.label,
+            "real_dynamics": scenario.real_dynamics or scenario.label,
             "strategy": strategy_label,
             "path": path_index,
             "time": float(time_value),
@@ -317,6 +382,7 @@ def run_experiment(
     config: ExperimentConfig,
     strategy_label: str,
     include_vega: bool,
+    scenarios: tuple[Scenario, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     target_instrument, delta_hedges, vega_hedges = build_target_and_hedges(config)
     hedging_instruments: list[InterestRateInstrument] = list(delta_hedges)
@@ -326,7 +392,7 @@ def run_experiment(
     path_rows: list[dict[str, float | str | int]] = []
     time_rows: list[dict[str, float | str | int]] = []
 
-    for scenario in build_scenarios(config):
+    for scenario in scenarios or build_scenarios(config):
         engine = DynamicHedgingEngine(
             pricing_engine=MonteCarloPricingEngine(n_paths=config.n_inner_paths),
             model_adapter=scenario.model_adapter,
@@ -334,7 +400,17 @@ def run_experiment(
             include_vega=include_vega,
             ridge_penalty=config.ridge_penalty,
         )
-        outer_paths = scenario.outer_model.generate_paths(config.n_outer_paths)
+        outer_paths = scenario.outer_paths
+        if outer_paths is None:
+            if scenario.outer_model is None:
+                raise ValueError(f"Scenario {scenario.label!r} has neither outer_paths nor outer_model.")
+            outer_paths = scenario.outer_model.generate_paths(config.n_outer_paths)
+        if outer_paths.n_paths != config.n_outer_paths:
+            raise ValueError("Outer-path count must match config.n_outer_paths.")
+        if not np.allclose(outer_paths.time, config.time_grid, atol=1.0e-12, rtol=0.0):
+            raise ValueError("Outer paths must use the experiment time grid.")
+        if not np.allclose(outer_paths.yield_curve_tenors, config.yield_curve_tenors, atol=1.0e-12, rtol=0.0):
+            raise ValueError("Outer paths must use the experiment yield-curve tenors.")
 
         for path_index in range(config.n_outer_paths):
             result = engine.run(
@@ -380,8 +456,13 @@ def make_plot(
     title: str,
     output_path: Path,
 ) -> None:
+    model_labels = sorted(path_summary["model"].unique())
+    if len(model_labels) != 2:
+        raise ValueError("make_plot expects exactly two model labels.")
+
     figure, axes = plt.subplots(2, 2, figsize=(14, 10))
-    colors = {"Hull-White": "#1f77b4", "G2++": "#d62728"}
+    palette = ["#1f77b4", "#d62728", "#2ca02c", "#ff7f0e"]
+    colors = {label: palette[index % len(palette)] for index, label in enumerate(model_labels)}
 
     for model_label, model_rows in path_summary.groupby("model"):
         axes[0, 0].hist(
@@ -400,7 +481,7 @@ def make_plot(
     metric_names = ["std", "var_95_loss", "cvar_95_loss", "cvar_99_loss"]
     x_positions = np.arange(len(metric_names), dtype=np.float64)
     width = 0.35
-    for offset, model_label in enumerate(sorted(final_pnl_risks["model"].unique())):
+    for offset, model_label in enumerate(model_labels):
         model_row = final_pnl_risks[final_pnl_risks["model"] == model_label].iloc[0]
         axes[0, 1].bar(
             x_positions + (offset - 0.5) * width,
@@ -414,7 +495,7 @@ def make_plot(
     axes[0, 1].set_ylabel("Loss / Dispersion")
     axes[0, 1].legend()
 
-    for axis_index, model_label in enumerate(sorted(time_summary["model"].unique())):
+    for axis_index, model_label in enumerate(model_labels):
         axis = axes[1, axis_index]
         model_rows = time_summary[time_summary["model"] == model_label]
         averaged = model_rows.groupby("time")[list(FINAL_COMPONENT_COLUMNS.values())].mean(numeric_only=True)
@@ -439,7 +520,9 @@ def make_plot(
 
 __all__ = [
     "ExperimentConfig",
+    "Scenario",
     "build_target_and_hedges",
+    "build_g2pp_misspecification_scenarios",
     "default_config",
     "make_plot",
     "run_experiment",
