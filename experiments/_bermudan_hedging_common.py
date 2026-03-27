@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 import sys
 
@@ -13,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from rateshedging.calibration.swaption_surface import (
     SwaptionSurfacePaths,
     SwaptionSurfaceSnapshot,
-    build_surface_paths,
+    build_lmm_atm_surface_paths,
 )
 from rateshedging.hedging.engine import DynamicHedgingEngine, HedgingResult
 from rateshedging.hedging.model_adapters import G2PPModelAdapter, HullWhiteModelAdapter, InterestRateModelAdapter
@@ -47,7 +49,7 @@ class ExperimentConfig:
     surface_expiries: FloatArray
     surface_swap_tenors: FloatArray
     n_outer_paths: int = 100
-    n_inner_paths: int = 1_000
+    n_inner_paths: int = 10_000
     curve_bump_size: float = 1.0e-4
     ridge_penalty: float = 1.0e6
     lmm_tenor_spacing: float = 0.5
@@ -62,6 +64,9 @@ class ExperimentConfig:
     g2_seed: int = 202
     pricing_seed_hw: int = 17
     pricing_seed_g2: int = 29
+    parallel_outer_paths: bool = True
+    min_parallel_outer_paths: int = 4
+    outer_workers: int | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +82,12 @@ class Scenario:
     def __post_init__(self) -> None:
         if self.outer_model is None and self.outer_paths is None:
             raise ValueError("A scenario requires either an outer_model or pre-generated outer_paths.")
+
+
+@dataclass(frozen=True)
+class _WorkerResult:
+    path_rows: list[dict[str, float | str | int]]
+    time_rows: list[dict[str, float | str | int]]
 
 
 def default_config() -> ExperimentConfig:
@@ -205,25 +216,17 @@ def _surface_template(config: ExperimentConfig) -> SwaptionSurfaceSnapshot:
     )
 
 
-def _stylized_market_surface(config: ExperimentConfig) -> SwaptionSurfaceSnapshot:
-    template = _surface_template(config)
-    anchor_adapter = G2PPModelAdapter(
-        mean_reversion_x=0.15,
-        mean_reversion_y=0.03,
-        volatility_x=0.0105,
-        volatility_y=0.0070,
-        correlation=-0.70,
-    )
-    return SwaptionSurfaceSnapshot(
-        expiries=config.surface_expiries,
-        swap_tenors=config.surface_swap_tenors,
-        normal_volatilities=anchor_adapter.surface_normal_volatilities(template),
-        weights=template.weights,
+def _lmm_terminal_horizon(config: ExperimentConfig) -> float:
+    return float(
+        max(
+            config.time_grid[-1] + config.yield_curve_tenors[-1],
+            config.time_grid[-1] + config.surface_expiries[-1] + config.surface_swap_tenors[-1],
+        )
     )
 
 
 def _build_lmm_loading_matrix(config: ExperimentConfig) -> FloatArray:
-    terminal_horizon = float(config.time_grid[-1] + config.yield_curve_tenors[-1])
+    terminal_horizon = _lmm_terminal_horizon(config)
     tenor_dates = np.arange(
         config.lmm_tenor_spacing,
         terminal_horizon + 1.0e-12,
@@ -284,24 +287,18 @@ def _calibrated_g2pp_adapter(
 
 def _surface_paths_from_market(
     config: ExperimentConfig,
+    outer_model: LIBORMarketModel,
     outer_paths: RatePaths,
-    market_surface: SwaptionSurfaceSnapshot,
 ) -> SwaptionSurfacePaths:
-    return build_surface_paths(
-        time_grid=config.time_grid,
-        curve_paths=outer_paths.yield_curve_paths,
-        curve_tenors=config.yield_curve_tenors,
+    return build_lmm_atm_surface_paths(
+        model=outer_model,
+        outer_paths=outer_paths,
         expiries=config.surface_expiries,
         swap_tenors=config.surface_swap_tenors,
-        base_normal_volatilities=market_surface.normal_volatilities,
-        factor_paths=outer_paths.yield_curve_factors,
     )
 
 
 def build_lmm_market_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
-    market_surface = _stylized_market_surface(config)
-    hull_white_market_adapter = _calibrated_hull_white_adapter(config, market_surface=market_surface)
-    g2pp_market_adapter = _calibrated_g2pp_adapter(config, market_surface=market_surface)
     outer_model = LIBORMarketModel(
         tenor_spacing=config.lmm_tenor_spacing,
         factor_loading_matrix=_build_lmm_loading_matrix(config),
@@ -309,10 +306,14 @@ def build_lmm_market_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]
         curve_times=config.curve_times,
         discount_factors=config.discount_factors,
         yield_curve_tenors=config.yield_curve_tenors,
+        terminal_horizon=_lmm_terminal_horizon(config),
         seed=config.lmm_seed,
     )
     shared_outer_paths = outer_model.generate_paths(config.n_outer_paths)
-    shared_surface_paths = _surface_paths_from_market(config, shared_outer_paths, market_surface)
+    shared_surface_paths = _surface_paths_from_market(config, outer_model, shared_outer_paths)
+    market_surface = shared_surface_paths.path(0).snapshot(0)
+    hull_white_market_adapter = _calibrated_hull_white_adapter(config, market_surface=market_surface)
+    g2pp_market_adapter = _calibrated_g2pp_adapter(config, market_surface=market_surface)
 
     return (
         Scenario(
@@ -450,6 +451,92 @@ def _time_profile_rows(
     return rows
 
 
+def _resolve_outer_worker_count(config: ExperimentConfig) -> int:
+    available_cores = os.cpu_count() or 1
+    requested_workers = config.outer_workers
+    if requested_workers is None:
+        requested_workers = max(1, available_cores - 1)
+    return max(1, min(int(requested_workers), config.n_outer_paths))
+
+
+def _should_parallelize_outer_loop(config: ExperimentConfig) -> bool:
+    return (
+        config.parallel_outer_paths
+        and config.n_outer_paths >= config.min_parallel_outer_paths
+        and _resolve_outer_worker_count(config) > 1
+    )
+
+
+def _run_experiment_chunk(
+    *,
+    config: ExperimentConfig,
+    scenario: Scenario,
+    strategy_label: str,
+    include_vega: bool,
+    path_indices: tuple[int, ...],
+) -> _WorkerResult:
+    target_instrument, delta_hedges, vega_hedges = build_target_and_hedges(config)
+    hedging_instruments: list[InterestRateInstrument] = list(delta_hedges)
+    if include_vega:
+        hedging_instruments.extend(vega_hedges)
+
+    engine = DynamicHedgingEngine(
+        pricing_engine=MonteCarloPricingEngine(n_paths=config.n_inner_paths),
+        model_adapter=scenario.model_adapter,
+        curve_bump_size=config.curve_bump_size,
+        include_vega=include_vega,
+        ridge_penalty=config.ridge_penalty,
+    )
+    outer_paths = scenario.outer_paths
+    if outer_paths is None:
+        if scenario.outer_model is None:
+            raise ValueError(f"Scenario {scenario.label!r} has neither outer_paths nor outer_model.")
+        outer_paths = scenario.outer_model.generate_paths(config.n_outer_paths)
+
+    path_rows: list[dict[str, float | str | int]] = []
+    time_rows: list[dict[str, float | str | int]] = []
+    for path_index in path_indices:
+        result = engine.run(
+            yield_curve_trajectory=outer_paths.yield_curve_paths[path_index],
+            time_grid=config.time_grid,
+            yield_curve_tenors=config.yield_curve_tenors,
+            target_instrument=target_instrument,
+            hedging_instruments=hedging_instruments,
+            swaption_surface_trajectory=(
+                scenario.outer_surface_paths.path(path_index)
+                if scenario.outer_surface_paths is not None
+                else None
+            ),
+        )
+
+        explained_pnl = (
+            np.sum(result.cash_carry_pnl)
+            + np.sum(result.target_cashflow_pnl)
+            + np.sum(result.hedge_cashflow_pnl)
+            + np.sum(result.target_revaluation_pnl)
+            + np.sum(result.hedge_revaluation_pnl)
+        )
+        if not np.isclose(explained_pnl, result.portfolio_value[-1], atol=1.0e-4, rtol=1.0e-8):
+            raise RuntimeError("Final PnL does not match the cumulative PnL breakdown.")
+
+        path_rows.append(
+            _path_summary_row(
+                scenario,
+                strategy_label,
+                path_index,
+                result,
+                config.curve_bump_size,
+            )
+        )
+        time_rows.extend(_time_profile_rows(scenario, strategy_label, path_index, result))
+
+    return _WorkerResult(path_rows=path_rows, time_rows=time_rows)
+
+
+def _run_experiment_chunk_from_payload(payload: dict) -> _WorkerResult:
+    return _run_experiment_chunk(**payload)
+
+
 def run_experiment(
     *,
     config: ExperimentConfig,
@@ -457,22 +544,10 @@ def run_experiment(
     include_vega: bool,
     scenarios: tuple[Scenario, ...] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    target_instrument, delta_hedges, vega_hedges = build_target_and_hedges(config)
-    hedging_instruments: list[InterestRateInstrument] = list(delta_hedges)
-    if include_vega:
-        hedging_instruments.extend(vega_hedges)
-
     path_rows: list[dict[str, float | str | int]] = []
     time_rows: list[dict[str, float | str | int]] = []
 
     for scenario in scenarios or build_lmm_market_scenarios(config):
-        engine = DynamicHedgingEngine(
-            pricing_engine=MonteCarloPricingEngine(n_paths=config.n_inner_paths),
-            model_adapter=scenario.model_adapter,
-            curve_bump_size=config.curve_bump_size,
-            include_vega=include_vega,
-            ridge_penalty=config.ridge_penalty,
-        )
         outer_paths = scenario.outer_paths
         if outer_paths is None:
             if scenario.outer_model is None:
@@ -490,43 +565,56 @@ def run_experiment(
             if not np.allclose(scenario.outer_surface_paths.time_grid, config.time_grid, atol=1.0e-12, rtol=0.0):
                 raise ValueError("Swaption surface paths must use the experiment time grid.")
 
-        for path_index in range(config.n_outer_paths):
-            result = engine.run(
-                yield_curve_trajectory=outer_paths.yield_curve_paths[path_index],
-                time_grid=config.time_grid,
-                yield_curve_tenors=config.yield_curve_tenors,
-                target_instrument=target_instrument,
-                hedging_instruments=hedging_instruments,
-                swaption_surface_trajectory=(
-                    scenario.outer_surface_paths.path(path_index)
-                    if scenario.outer_surface_paths is not None
-                    else None
-                ),
+        if _should_parallelize_outer_loop(config):
+            worker_count = _resolve_outer_worker_count(config)
+            index_chunks = [
+                tuple(int(path_index) for path_index in chunk.tolist())
+                for chunk in np.array_split(np.arange(config.n_outer_paths, dtype=np.int64), worker_count)
+                if chunk.size > 0
+            ]
+            worker_payloads = [
+                {
+                    "config": config,
+                    "scenario": scenario,
+                    "strategy_label": strategy_label,
+                    "include_vega": include_vega,
+                    "path_indices": chunk,
+                }
+                for chunk in index_chunks
+            ]
+            try:
+                with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                    worker_results = list(
+                        executor.map(
+                            _run_experiment_chunk_from_payload,
+                            worker_payloads,
+                        )
+                    )
+                for worker_result in worker_results:
+                    path_rows.extend(worker_result.path_rows)
+                    time_rows.extend(worker_result.time_rows)
+            except (OSError, PermissionError):
+                for payload in worker_payloads:
+                    worker_result = _run_experiment_chunk_from_payload(payload)
+                    path_rows.extend(worker_result.path_rows)
+                    time_rows.extend(worker_result.time_rows)
+        else:
+            worker_result = _run_experiment_chunk(
+                config=config,
+                scenario=scenario,
+                strategy_label=strategy_label,
+                include_vega=include_vega,
+                path_indices=tuple(range(config.n_outer_paths)),
             )
-
-            explained_pnl = (
-                np.sum(result.cash_carry_pnl)
-                + np.sum(result.target_cashflow_pnl)
-                + np.sum(result.hedge_cashflow_pnl)
-                + np.sum(result.target_revaluation_pnl)
-                + np.sum(result.hedge_revaluation_pnl)
-            )
-            if not np.isclose(explained_pnl, result.portfolio_value[-1], atol=1.0e-4, rtol=1.0e-8):
-                raise RuntimeError("Final PnL does not match the cumulative PnL breakdown.")
-
-            path_rows.append(
-                _path_summary_row(
-                    scenario,
-                    strategy_label,
-                    path_index,
-                    result,
-                    config.curve_bump_size,
-                )
-            )
-            time_rows.extend(_time_profile_rows(scenario, strategy_label, path_index, result))
+            path_rows.extend(worker_result.path_rows)
+            time_rows.extend(worker_result.time_rows)
 
     path_summary = pd.DataFrame(path_rows)
     time_summary = pd.DataFrame(time_rows)
+    if not path_summary.empty:
+        path_summary = path_summary.sort_values(["strategy", "model", "path"], kind="stable").reset_index(drop=True)
+    if not time_summary.empty:
+        time_summary = time_summary.sort_values(["strategy", "model", "path", "time"], kind="stable").reset_index(drop=True)
     risk_summary = summarize_risk_metrics(path_summary)
     return path_summary, time_summary, risk_summary
 

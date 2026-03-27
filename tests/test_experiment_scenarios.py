@@ -30,6 +30,9 @@ class ExperimentScenarioTests(unittest.TestCase):
         self.assertIs(scenarios[0].outer_surface_paths, scenarios[1].outer_surface_paths)
         np.testing.assert_allclose(scenarios[0].outer_paths.time, config.time_grid)
         np.testing.assert_allclose(scenarios[0].outer_paths.yield_curve_tenors, config.yield_curve_tenors)
+        initial_surface = scenarios[0].outer_surface_paths.normal_volatility_paths[:, 0, :, :]
+        np.testing.assert_allclose(initial_surface[0], initial_surface[1], atol=1.0e-12)
+        self.assertTrue(np.all(initial_surface > 0.0))
 
     def test_run_experiment_accepts_shared_outer_paths(self) -> None:
         config = replace(default_config(), n_outer_paths=2, n_inner_paths=200)

@@ -88,6 +88,9 @@ class GaussianModelPathGenerationTests(unittest.TestCase):
         self.assertEqual(paths.yield_curve_paths.shape, (5_000, self.time_grid.size, self.tenors.size))
         self.assertEqual(paths.stochastic_discount_factors.shape, (5_000, self.time_grid.size))
         self.assertEqual(paths.yield_curve_factors.shape, (5_000, self.time_grid.size, 3))
+        self.assertIsNotNone(paths.forward_rate_paths)
+        self.assertIsNotNone(paths.forward_rate_tenor_dates)
+        self.assertEqual(paths.forward_rate_paths.shape[:2], (5_000, self.time_grid.size))
         np.testing.assert_allclose(paths.yield_curve_paths[0, 0], self.expected_initial_yields, atol=1.0e-10)
         np.testing.assert_allclose(
             paths.stochastic_discount_factors.mean(axis=0),

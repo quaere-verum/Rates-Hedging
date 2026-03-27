@@ -5,6 +5,8 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
+from rateshedging.models.libor_market_model import LIBORMarketModel
+from rateshedging.models.model import RatePaths
 from rateshedging.models._curve_utils import as_1d_float_array, validate_time_grid
 from rateshedging.pricing.curve import CurveSnapshot
 
@@ -296,11 +298,50 @@ def build_surface_paths(
     )
 
 
+def build_lmm_atm_surface_paths(
+    *,
+    model: LIBORMarketModel,
+    outer_paths: RatePaths,
+    expiries: ArrayLike,
+    swap_tenors: ArrayLike,
+) -> SwaptionSurfacePaths:
+    if outer_paths.forward_rate_paths is None or outer_paths.forward_rate_tenor_dates is None:
+        raise ValueError("outer_paths must include forward_rate_paths and forward_rate_tenor_dates.")
+    if not np.allclose(outer_paths.time, model.time_grid, atol=1.0e-12, rtol=0.0):
+        raise ValueError("outer_paths.time must match the LMM time grid.")
+    if outer_paths.forward_rate_paths.shape[:2] != (outer_paths.n_paths, outer_paths.time.size):
+        raise ValueError("forward_rate_paths must have shape (n_paths, n_times, n_forwards).")
+
+    expiries_array = as_1d_float_array(expiries, "expiries")
+    swap_tenors_array = as_1d_float_array(swap_tenors, "swap_tenors")
+    surface_paths = np.empty(
+        (outer_paths.n_paths, outer_paths.time.size, expiries_array.size, swap_tenors_array.size),
+        dtype=np.float64,
+    )
+
+    for path_index in range(outer_paths.n_paths):
+        for time_index, valuation_time in enumerate(outer_paths.time):
+            surface_paths[path_index, time_index] = model.atm_normal_volatilities_from_forward_curve(
+                outer_paths.forward_rate_paths[path_index, time_index],
+                float(valuation_time),
+                expiries_array,
+                swap_tenors_array,
+            )
+
+    return SwaptionSurfacePaths(
+        time_grid=outer_paths.time,
+        expiries=expiries_array,
+        swap_tenors=swap_tenors_array,
+        normal_volatility_paths=surface_paths,
+    )
+
+
 __all__ = [
     "SwaptionSurfacePaths",
     "SwaptionSurfaceSnapshot",
     "SwaptionSurfaceTrajectory",
     "apply_curve_surface_adjustment",
+    "build_lmm_atm_surface_paths",
     "build_surface_paths",
     "g2pp_atm_normal_volatilities",
     "hull_white_atm_normal_volatilities",

@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from rateshedging.calibration.swaption_surface import (
     SwaptionSurfaceSnapshot,
     SwaptionSurfaceTrajectory,
+    build_lmm_atm_surface_paths,
     g2pp_atm_normal_volatilities,
     hull_white_atm_normal_volatilities,
 )
@@ -21,6 +22,7 @@ from rateshedging.instruments.swap import Swap
 from rateshedging.instruments.swaption import Swaption
 from rateshedging.pricing.curve import CurveSnapshot
 from rateshedging.pricing.engine import MonteCarloPricingEngine
+from rateshedging.models.libor_market_model import LIBORMarketModel
 
 
 class CalibrationPipelineTests(unittest.TestCase):
@@ -144,6 +146,57 @@ class CalibrationPipelineTests(unittest.TestCase):
         np.testing.assert_allclose(result.calibrated_parameters[:, 0], np.array([0.010, 0.011]), atol=1.0e-10)
         np.testing.assert_allclose(result.calibration_rmse, np.zeros(time_grid.size), atol=1.0e-12)
         np.testing.assert_allclose(result.portfolio_value, np.zeros(time_grid.size), atol=1.0e-5)
+
+    def test_lmm_surface_paths_are_implied_from_the_same_forward_state(self) -> None:
+        curve_times = np.linspace(0.0, 20.0, 81, dtype=np.float64)
+        discount_factors = np.exp(-0.02 * curve_times)
+        time_grid = np.array([0.0, 0.5, 1.0], dtype=np.float64)
+        curve_tenors = np.array([0.5, 1.0, 2.0, 5.0], dtype=np.float64)
+        expiries = np.array([0.5, 1.0], dtype=np.float64)
+        swap_tenors = np.array([1.0, 2.0], dtype=np.float64)
+        loading_matrix = np.array(
+            [
+                [0.18, -0.06],
+                [0.17, -0.04],
+                [0.16, -0.02],
+                [0.15, 0.00],
+                [0.14, 0.01],
+                [0.13, 0.02],
+                [0.12, 0.03],
+                [0.11, 0.04],
+                [0.10, 0.05],
+                [0.09, 0.06],
+                [0.08, 0.07],
+                [0.07, 0.08],
+            ],
+            dtype=np.float64,
+        )
+        model = LIBORMarketModel(
+            tenor_spacing=0.5,
+            factor_loading_matrix=loading_matrix,
+            time_grid=time_grid,
+            curve_times=curve_times,
+            discount_factors=discount_factors,
+            yield_curve_tenors=curve_tenors,
+            terminal_horizon=6.0,
+            seed=321,
+        )
+        outer_paths = model.generate_paths(2)
+        surface_paths = build_lmm_atm_surface_paths(
+            model=model,
+            outer_paths=outer_paths,
+            expiries=expiries,
+            swap_tenors=swap_tenors,
+        )
+
+        direct_surface = model.atm_normal_volatilities_from_forward_curve(
+            outer_paths.forward_rate_paths[0, 1],
+            valuation_time=float(time_grid[1]),
+            expiries=expiries,
+            swap_tenors=swap_tenors,
+        )
+        np.testing.assert_allclose(surface_paths.normal_volatility_paths[0, 1], direct_surface, atol=1.0e-12)
+        self.assertTrue(np.all(surface_paths.normal_volatility_paths > 0.0))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,8 @@ class RatePaths:
     yield_curve_tenors: np.ndarray
     time: np.ndarray
     n_paths: int
+    forward_rate_paths: np.ndarray | None = None
+    forward_rate_tenor_dates: np.ndarray | None = None
 
 class InterestRateModel(abc.ABC):
     @abc.abstractmethod

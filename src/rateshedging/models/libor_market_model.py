@@ -24,6 +24,7 @@ class LIBORMarketModel(InterestRateModel):
         curve_times: ArrayLike,
         discount_factors: ArrayLike,
         yield_curve_tenors: ArrayLike,
+        terminal_horizon: float | None = None,
         seed: int | None = None,
     ) -> None:
         if tenor_spacing <= 0.0:
@@ -35,13 +36,17 @@ class LIBORMarketModel(InterestRateModel):
         self._curve = LogLinearDiscountCurve(curve_times, discount_factors)
         self._rng = np.random.default_rng(seed)
 
-        terminal_horizon = float(self.time_grid[-1] + self.yield_curve_tenors[-1])
-        n_periods = int(round(terminal_horizon / self.tenor_spacing))
-        if not np.isclose(n_periods * self.tenor_spacing, terminal_horizon, atol=1.0e-10, rtol=0.0):
+        minimum_terminal_horizon = float(self.time_grid[-1] + self.yield_curve_tenors[-1])
+        resolved_terminal_horizon = minimum_terminal_horizon if terminal_horizon is None else float(terminal_horizon)
+        if resolved_terminal_horizon < minimum_terminal_horizon - 1.0e-10:
+            raise ValueError("terminal_horizon must cover the full output yield-curve horizon.")
+        n_periods = int(round(resolved_terminal_horizon / self.tenor_spacing))
+        if not np.isclose(n_periods * self.tenor_spacing, resolved_terminal_horizon, atol=1.0e-10, rtol=0.0):
             raise ValueError("time_grid[-1] + yield_curve_tenors[-1] must be a multiple of tenor_spacing.")
+        self.terminal_horizon = resolved_terminal_horizon
         self._tenor_dates = np.arange(
             self.tenor_spacing,
-            terminal_horizon + 1.0e-12,
+            resolved_terminal_horizon + 1.0e-12,
             self.tenor_spacing,
             dtype=np.float64,
         )
@@ -93,6 +98,60 @@ class LIBORMarketModel(InterestRateModel):
 
         self.n_factors = int(self._factor_loading_matrix.shape[1])
 
+    def _time_index_on_tenor_grid(self, horizon: float, *, label: str) -> int:
+        step_index = int(round(horizon / self.tenor_spacing))
+        if not np.isclose(step_index * self.tenor_spacing, horizon, atol=1.0e-10, rtol=0.0):
+            raise ValueError(f"{label} must lie on the LMM tenor grid.")
+        return step_index
+
+    def atm_normal_volatilities_from_forward_curve(
+        self,
+        forward_rates: ArrayLike,
+        valuation_time: float,
+        expiries: ArrayLike,
+        swap_tenors: ArrayLike,
+    ) -> FloatArray:
+        forward_array = np.asarray(forward_rates, dtype=np.float64)
+        if forward_array.shape != self._initial_forwards.shape:
+            raise ValueError("forward_rates must match the LMM forward tenor grid.")
+        expiries_array = as_1d_float_array(expiries, "expiries")
+        swap_tenors_array = as_1d_float_array(swap_tenors, "swap_tenors")
+        if np.any(expiries_array <= 0.0) or np.any(swap_tenors_array <= 0.0):
+            raise ValueError("expiries and swap_tenors must be strictly positive.")
+
+        active_index = self._time_index_on_tenor_grid(float(valuation_time), label="valuation_time")
+        active_forwards = forward_array[active_index:]
+        active_loadings = self._factor_loading_matrix[active_index:]
+        active_discounts = np.cumprod(
+            1.0 / (1.0 + self._taus[active_index:] * active_forwards),
+            axis=0,
+        )
+        discount_nodes = np.concatenate(([1.0], active_discounts))
+
+        normal_vols = np.empty((expiries_array.size, swap_tenors_array.size), dtype=np.float64)
+        for expiry_index, expiry in enumerate(expiries_array):
+            expiry_steps = self._time_index_on_tenor_grid(float(expiry), label="expiry")
+            for tenor_index, swap_tenor in enumerate(swap_tenors_array):
+                swap_steps = self._time_index_on_tenor_grid(float(swap_tenor), label="swap_tenor")
+                start_index = expiry_steps
+                end_index = start_index + swap_steps
+                if end_index > active_forwards.size:
+                    raise ValueError("LMM terminal horizon is too short for the requested expiry/tenor surface.")
+
+                payment_discounts = discount_nodes[start_index + 1 : end_index + 1]
+                annuity = self.tenor_spacing * np.sum(payment_discounts)
+                if annuity <= 0.0:
+                    raise ValueError("Swap annuity must remain strictly positive.")
+
+                weights = self.tenor_spacing * payment_discounts / annuity
+                forwards_segment = active_forwards[start_index:end_index]
+                loadings_segment = active_loadings[start_index:end_index]
+                weighted_loadings = (weights * forwards_segment) @ loadings_segment
+                normal_variance = float(weighted_loadings @ weighted_loadings)
+                normal_vols[expiry_index, tenor_index] = np.sqrt(max(normal_variance, 1.0e-16))
+
+        return normal_vols
+
     def _curve_from_forwards(
         self,
         forwards: FloatArray,
@@ -127,10 +186,12 @@ class LIBORMarketModel(InterestRateModel):
         yield_curve_paths = np.empty((n_paths, n_times, self.yield_curve_tenors.size), dtype=np.float64)
         stochastic_discount_factors = np.empty((n_paths, n_times), dtype=np.float64)
         yield_curve_factors = np.empty((n_paths, n_times, n_factors), dtype=np.float64)
+        forward_rate_paths = np.empty((n_paths, n_times, forwards.shape[1]), dtype=np.float64)
 
         yield_curve_paths[:, 0, :] = self._curve_from_forwards(forwards, 0, 0.0)
         stochastic_discount_factors[:, 0] = 1.0
         yield_curve_factors[:, 0, :] = 0.0
+        forward_rate_paths[:, 0, :] = forwards
 
         for time_position in range(1, n_times):
             previous_index = int(self._time_indices[time_position - 1])
@@ -164,6 +225,7 @@ class LIBORMarketModel(InterestRateModel):
             current_time = float(self.time_grid[time_position])
             yield_curve_paths[:, time_position, :] = self._curve_from_forwards(forwards, current_index, current_time)
             yield_curve_factors[:, time_position, :] = factor_states
+            forward_rate_paths[:, time_position, :] = forwards
 
         return RatePaths(
             yield_curve_paths=yield_curve_paths,
@@ -172,6 +234,8 @@ class LIBORMarketModel(InterestRateModel):
             yield_curve_tenors=self.yield_curve_tenors.copy(),
             time=self.time_grid.copy(),
             n_paths=n_paths,
+            forward_rate_paths=forward_rate_paths,
+            forward_rate_tenor_dates=self._tenor_dates.copy(),
         )
 
 
