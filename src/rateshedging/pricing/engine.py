@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from weakref import WeakKeyDictionary
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,10 +27,12 @@ class PricingResult:
 
 
 def _time_index(time_grid: FloatArray, target_time: float) -> int:
-    matches = np.flatnonzero(np.isclose(time_grid, target_time, atol=1.0e-12, rtol=0.0))
-    if matches.size == 0:
-        raise ValueError(f"Model time grid must contain {target_time}.")
-    return int(matches[0])
+    candidate = int(np.searchsorted(time_grid, target_time))
+    if candidate < time_grid.size and abs(float(time_grid[candidate]) - target_time) <= 1.0e-12:
+        return candidate
+    if candidate > 0 and abs(float(time_grid[candidate - 1]) - target_time) <= 1.0e-12:
+        return candidate - 1
+    raise ValueError(f"Model time grid must contain {target_time}.")
 
 class MonteCarloPricingEngine:
     def __init__(
@@ -41,6 +44,14 @@ class MonteCarloPricingEngine:
             raise ValueError("n_paths must be a strictly positive integer.")
         self.n_paths = int(n_paths)
         self.exercise_strategy = exercise_strategy or LongstaffSchwartzExerciseStrategy()
+        self._path_cache: WeakKeyDictionary[InterestRateModel, object] = WeakKeyDictionary()
+
+    def _paths_for_model(self, model: InterestRateModel):
+        cached = self._path_cache.get(model)
+        if cached is None:
+            cached = model.generate_paths(self.n_paths)
+            self._path_cache[model] = cached
+        return cached
 
     def price(
         self,
@@ -67,7 +78,7 @@ class MonteCarloPricingEngine:
         return PricingResult(price=float(price), standard_error=0.0, n_paths=1)
 
     def _price_swaption(self, instrument: Swaption, model: InterestRateModel, valuation_time: float) -> PricingResult:
-        paths = model.generate_paths(self.n_paths)
+        paths = self._paths_for_model(model)
         expiry_index = _time_index(paths.time, instrument.expiry - valuation_time)
 
         exercise_value = instrument.exercise_value_from_zero_rates(
@@ -89,7 +100,7 @@ class MonteCarloPricingEngine:
         model: InterestRateModel,
         valuation_time: float,
     ) -> PricingResult:
-        paths = model.generate_paths(self.n_paths)
+        paths = self._paths_for_model(model)
         remaining_exercise_times = instrument.exercise_times[
             instrument.exercise_times >= valuation_time - 1.0e-12
         ]

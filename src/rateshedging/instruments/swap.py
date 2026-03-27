@@ -33,10 +33,14 @@ class Swap(InterestRateInstrument):
             raise ValueError("notional must be strictly positive.")
 
         object.__setattr__(self, "payment_times", payment_times)
+        accrual_start_times = np.concatenate(([self.start_time], payment_times[:-1]))
+        year_fractions = payment_times - accrual_start_times
+        object.__setattr__(self, "_accrual_start_times", accrual_start_times)
+        object.__setattr__(self, "_year_fractions", year_fractions)
 
     @property
     def accrual_start_times(self) -> FloatArray:
-        return np.concatenate(([self.start_time], self.payment_times[:-1]))
+        return self._accrual_start_times.copy()
 
     @property
     def accrual_end_times(self) -> FloatArray:
@@ -44,7 +48,7 @@ class Swap(InterestRateInstrument):
 
     @property
     def year_fractions(self) -> FloatArray:
-        return self.accrual_end_times - self.accrual_start_times
+        return self._year_fractions.copy()
 
     @property
     def direction(self) -> float:
@@ -52,16 +56,63 @@ class Swap(InterestRateInstrument):
         long_direction = 1.0 if self.is_long else -1.0
         return payer_direction * long_direction
 
-    def _remaining_schedule(self, valuation_time: float) -> tuple[FloatArray, FloatArray, FloatArray]:
-        payment_times = self.payment_times
-        accrual_starts = self.accrual_start_times
-        accrual_ends = self.accrual_end_times
-        outstanding = payment_times > valuation_time + 1.0e-12
-        return accrual_starts[outstanding], accrual_ends[outstanding], payment_times[outstanding]
+    def _remaining_schedule(self, valuation_time: float) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray]:
+        start_index = int(np.searchsorted(self.payment_times, valuation_time + 1.0e-12, side="right"))
+        return (
+            self._accrual_start_times[start_index:],
+            self.payment_times[start_index:],
+            self.payment_times[start_index:],
+            self._year_fractions[start_index:],
+        )
+
+    def _floating_leg_pv_from_discount_factors(
+        self,
+        payment_discounts: FloatArray,
+        zero_rates: ArrayLike,
+        curve_tenors: ArrayLike,
+        valuation_time: float,
+        accrual_starts: FloatArray,
+        accrual_ends: FloatArray,
+        year_fractions: FloatArray,
+    ) -> FloatArray:
+        if payment_discounts.shape[-1] == 0:
+            return np.zeros(np.asarray(zero_rates, dtype=np.float64).shape[:-1], dtype=np.float64)
+
+        # Most swap valuations in the engine occur without explicit floating fixings,
+        # so we use the equivalent telescoping discount-factor identity in the hot path.
+        if not self.floating_rate_fixings:
+            start_maturity = max(float(accrual_starts[0] - valuation_time), 0.0)
+            start_discount = discount_from_zero_rates(
+                zero_rates,
+                curve_tenors,
+                np.asarray([start_maturity], dtype=np.float64),
+            )[..., 0]
+            return self.notional * (start_discount - payment_discounts[..., -1])
+
+        coupon_pv = np.zeros(np.asarray(zero_rates, dtype=np.float64).shape[:-1], dtype=np.float64)
+        continuation_index = 0
+        if accrual_starts.size > 0:
+            first_start = float(accrual_starts[0])
+            first_end = float(accrual_ends[0])
+            if first_start <= valuation_time < first_end:
+                fixing = self.floating_rate_fixings.get(first_start)
+                if fixing is not None:
+                    coupon_pv = self.notional * fixing * year_fractions[0] * payment_discounts[..., 0]
+                    continuation_index = 1
+
+        if continuation_index >= accrual_starts.size:
+            return coupon_pv
+
+        start_maturity = max(float(accrual_starts[continuation_index] - valuation_time), 0.0)
+        start_discount = discount_from_zero_rates(
+            zero_rates,
+            curve_tenors,
+            np.asarray([start_maturity], dtype=np.float64),
+        )[..., 0]
+        return coupon_pv + self.notional * (start_discount - payment_discounts[..., -1])
 
     def fixed_leg_cashflows(self, valuation_time: float = 0.0) -> tuple[Cashflow, ...]:
-        accrual_starts, accrual_ends, payment_times = self._remaining_schedule(valuation_time)
-        year_fractions = accrual_ends - accrual_starts
+        accrual_starts, accrual_ends, payment_times, year_fractions = self._remaining_schedule(valuation_time)
         fixed_sign = -self.direction
 
         return tuple(
@@ -83,11 +134,10 @@ class Swap(InterestRateInstrument):
         )
 
     def floating_leg_cashflows(self, curve: CurveSnapshot, valuation_time: float = 0.0) -> tuple[Cashflow, ...]:
-        accrual_starts, accrual_ends, payment_times = self._remaining_schedule(valuation_time)
+        accrual_starts, accrual_ends, payment_times, year_fractions = self._remaining_schedule(valuation_time)
         if payment_times.size == 0:
             return ()
 
-        year_fractions = accrual_ends - accrual_starts
         start_times = np.maximum(accrual_starts - valuation_time, 0.0)
         end_times = accrual_ends - valuation_time
         forward_rates = forward_rates_from_zero_rates(curve.zero_rates, curve.tenors, start_times, end_times)
@@ -123,12 +173,10 @@ class Swap(InterestRateInstrument):
         return self.fixed_leg_cashflows(valuation_time) + self.floating_leg_cashflows(curve, valuation_time)
 
     def annuity_from_zero_rates(self, zero_rates: ArrayLike, curve_tenors: ArrayLike, valuation_time: float = 0.0) -> FloatArray:
-        _, _, payment_times = self._remaining_schedule(valuation_time)
+        _, _, payment_times, year_fractions = self._remaining_schedule(valuation_time)
         if payment_times.size == 0:
             return np.zeros(np.asarray(zero_rates, dtype=np.float64).shape[:-1], dtype=np.float64)
 
-        accrual_starts, accrual_ends, payment_times = self._remaining_schedule(valuation_time)
-        year_fractions = accrual_ends - accrual_starts
         payment_maturities = payment_times - valuation_time
         payment_discounts = discount_from_zero_rates(zero_rates, curve_tenors, payment_maturities)
         return self.notional * np.sum(payment_discounts * year_fractions, axis=-1)
@@ -144,18 +192,21 @@ class Swap(InterestRateInstrument):
         curve_tenors: ArrayLike,
         valuation_time: float = 0.0,
     ) -> FloatArray:
-        accrual_starts, accrual_ends, payment_times = self._remaining_schedule(valuation_time)
+        accrual_starts, accrual_ends, payment_times, year_fractions = self._remaining_schedule(valuation_time)
         if payment_times.size == 0:
             return np.zeros(np.asarray(zero_rates, dtype=np.float64).shape[:-1], dtype=np.float64)
 
-        year_fractions = accrual_ends - accrual_starts
-        start_maturities = np.maximum(accrual_starts - valuation_time, 0.0)
-        end_maturities = accrual_ends - valuation_time
         payment_maturities = payment_times - valuation_time
-
-        forward_rates = forward_rates_from_zero_rates(zero_rates, curve_tenors, start_maturities, end_maturities)
         payment_discounts = discount_from_zero_rates(zero_rates, curve_tenors, payment_maturities)
-        return self.notional * np.sum(payment_discounts * forward_rates * year_fractions, axis=-1)
+        return self._floating_leg_pv_from_discount_factors(
+            payment_discounts,
+            zero_rates,
+            curve_tenors,
+            valuation_time,
+            accrual_starts,
+            accrual_ends,
+            year_fractions,
+        )
 
     def present_value_from_zero_rates(
         self,
@@ -163,8 +214,22 @@ class Swap(InterestRateInstrument):
         curve_tenors: ArrayLike,
         valuation_time: float = 0.0,
     ) -> FloatArray:
-        fixed_leg_pv = self.fixed_rate * self.annuity_from_zero_rates(zero_rates, curve_tenors, valuation_time)
-        floating_leg_pv = self.projected_floating_leg_pv_from_zero_rates(zero_rates, curve_tenors, valuation_time)
+        accrual_starts, accrual_ends, payment_times, year_fractions = self._remaining_schedule(valuation_time)
+        if payment_times.size == 0:
+            return np.zeros(np.asarray(zero_rates, dtype=np.float64).shape[:-1], dtype=np.float64)
+
+        payment_maturities = payment_times - valuation_time
+        payment_discounts = discount_from_zero_rates(zero_rates, curve_tenors, payment_maturities)
+        fixed_leg_pv = self.fixed_rate * self.notional * np.sum(payment_discounts * year_fractions, axis=-1)
+        floating_leg_pv = self._floating_leg_pv_from_discount_factors(
+            payment_discounts,
+            zero_rates,
+            curve_tenors,
+            valuation_time,
+            accrual_starts,
+            accrual_ends,
+            year_fractions,
+        )
         return self.direction * (floating_leg_pv - fixed_leg_pv)
 
     def present_value_from_curve(self, curve: CurveSnapshot, valuation_time: float = 0.0) -> float:

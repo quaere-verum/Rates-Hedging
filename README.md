@@ -1,16 +1,17 @@
 # Rates-Hedging
 
-`rates-hedging` is a compact research codebase for simulating interest-rate models, pricing swaps and swaptions, and studying dynamic hedging of Bermudan swaptions under different model assumptions.
+`rates-hedging` is a compact research codebase for simulating interest-rate models, calibrating desk models to market snapshots, and studying dynamic hedging of Bermudan swaptions under an LMM-driven outer market.
 
 The repository currently focuses on:
 
-- Gaussian short-rate models: Hull-White and G2++
+- Outer market simulation with a LIBOR Market Model
+- Desk pricing and hedging models: Hull-White and G2++
 - Calibration of model vol parameters to ATM European swaption surfaces
 - Interest-rate instruments: swaps, European swaptions, Bermudan swaptions
 - Monte Carlo pricing with Longstaff-Schwartz regression for Bermudan exercise
 - Pathwise hedging with curve-delta and optional model-vega hedging
 - Snapshot-by-snapshot recalibration to yield-curve and swaption-surface trajectories
-- Reproducible experiments that compare hedge PnL across models and hedge sets
+- One reproducible experiment that compares hedge PnL across models and hedge sets on the same outer market
 
 ## Repository Overview
 
@@ -20,6 +21,7 @@ The main code lives in `src/rateshedging/`:
   - `model.py`: abstract base class for rate models
   - `hull_white.py`: one-factor Hull-White path generation
   - `g2pp.py`: two-factor G2++ path generation
+  - `libor_market_model.py`: multi-factor LIBOR Market Model for outer market simulation
 - `instruments/`
   - `instrument.py`: abstract base class for interest-rate instruments
   - `swap.py`: fixed-for-floating swap cashflows and curve-based PV logic
@@ -66,100 +68,51 @@ To run every experiment in sequence:
 .\run_experiments.ps1
 ```
 
-This executes:
+This executes the single end-to-end study:
 
-1. `experiments/compare_bermudan_hedging.py`
-2. `experiments/bermudan_delta_pnl_breakdown.py`
-3. `experiments/bermudan_delta_vega_pnl_breakdown.py`
-4. `experiments/bermudan_model_misspecification_pnl_breakdown.py`
+1. `experiments/lmm_outer_hedging_comparison.py`
 
-Each script writes plots and CSV summaries into `artifacts/`.
+The script writes plots and CSV summaries into `artifacts/`.
 
-The full batch is computationally heavy. On the current configuration, the delta and delta+vega studies are much slower than the simple model-comparison experiment because they repeatedly reprice Bermudan and European options along many hedge dates.
+The experiment is computationally heavy because it repeatedly recalibrates HW and G2++ on each outer market snapshot and then reprices Bermudan and European options along many hedge dates.
 
 ## Experiment Overview
 
-### 1. Bermudan Hedging: Hull-White vs G2++
+### Bermudan Hedging on an LMM Outer Market
 
-`experiments/compare_bermudan_hedging.py` compares Bermudan swaption hedging under a Hull-White-consistent setup and a G2++-consistent setup using curve-delta hedging instruments. It reports final hedge PnL and the average absolute hedge error through time.
+`experiments/lmm_outer_hedging_comparison.py` is the single top-level study in the repository.
 
-Generated files:
+The experiment uses:
 
-- `artifacts/bermudan_hedging_hw_vs_g2pp.png`
-- `artifacts/bermudan_hedging_hw_vs_g2pp.csv`
+- an outer LIBOR Market Model to generate the yield-curve trajectory
+- a semi-realistic ATM swaption-surface trajectory linked to the outer market path
+- an inner Monte Carlo pricing loop in which the desk recalibrates either Hull-White or G2++ at every hedge date
+- two hedge sets on the exact same outer market paths:
+  - delta-only
+  - delta+vega
 
-![Hull-White vs G2++ hedging comparison](artifacts/bermudan_hedging_hw_vs_g2pp.png)
+This makes the comparison internally coherent:
 
-### 2. Delta-Hedging PnL Breakdown
-
-`experiments/bermudan_delta_pnl_breakdown.py` studies Bermudan swaption delta hedging under both models. The script records a pathwise PnL decomposition into:
-
-- cash carry
-- target cashflows
-- hedge cashflows
-- target revaluation
-- hedge revaluation
-
-It also reports distributional risk metrics for the final PnL and each PnL component, including:
-
-- mean
-- standard deviation
-- median
-- 95% and 99% loss VaR
-- 95% and 99% loss CVaR
+- the market is the same for every desk and hedge set
+- the desk models are compared on identical outer scenarios
+- the impact of adding vega hedges is evaluated on the same paths rather than across different experiments
 
 Generated files:
 
-- `artifacts/bermudan_delta_pnl_breakdown.png`
-- `artifacts/bermudan_delta_pnl_breakdown_paths.csv`
-- `artifacts/bermudan_delta_pnl_breakdown_time.csv`
-- `artifacts/bermudan_delta_pnl_breakdown_risk.csv`
-
-![Delta-hedging PnL breakdown](artifacts/bermudan_delta_pnl_breakdown.png)
-
-### 3. Delta + Vega Hedging PnL Breakdown
-
-`experiments/bermudan_delta_vega_pnl_breakdown.py` extends the previous setup by allowing the hedging engine to neutralize both curve-delta and model-vega risk. The hedge set augments the swap hedges with swaptions so that volatility risk can be traded as well.
-
-The same PnL decomposition and distributional risk metrics are produced, which makes it straightforward to compare:
-
-- delta-only vs delta+vega hedging
-- Hull-White vs G2++
-- central dispersion vs downside tail behavior
-
-Generated files:
-
-- `artifacts/bermudan_delta_vega_pnl_breakdown.png`
-- `artifacts/bermudan_delta_vega_pnl_breakdown_paths.csv`
-- `artifacts/bermudan_delta_vega_pnl_breakdown_time.csv`
-- `artifacts/bermudan_delta_vega_pnl_breakdown_risk.csv`
-
-![Delta + vega hedging PnL breakdown](artifacts/bermudan_delta_vega_pnl_breakdown.png)
-
-### 4. Model Misspecification: Hull-White Pricing on G2++ Dynamics
-
-`experiments/bermudan_model_misspecification_pnl_breakdown.py` fixes the realized market dynamics to G2++ paths and compares two desks on the exact same outer scenarios:
-
-- a misspecified desk that prices and hedges with Hull-White
-- a correctly specified desk that prices and hedges with G2++
-
-The script keeps the hedge set delta-only so the comparison isolates model misspecification rather than differences in model-vega parameterization. It writes the same pathwise PnL decomposition and risk summaries as the other breakdown studies.
-
-Generated files:
-
-- `artifacts/bermudan_model_misspecification_pnl_breakdown.png`
-- `artifacts/bermudan_model_misspecification_pnl_breakdown_paths.csv`
-- `artifacts/bermudan_model_misspecification_pnl_breakdown_time.csv`
-- `artifacts/bermudan_model_misspecification_pnl_breakdown_risk.csv`
+- `artifacts/lmm_outer_hedging_comparison_overview.png`
+- `artifacts/lmm_outer_hedging_comparison_breakdown.png`
+- `artifacts/lmm_outer_hedging_comparison_paths.csv`
+- `artifacts/lmm_outer_hedging_comparison_time.csv`
+- `artifacts/lmm_outer_hedging_comparison_risk.csv`
 
 ## Current Takeaways
 
 From the current generated artifacts:
 
-- G2++ produces tighter Bermudan hedge PnL distributions than Hull-White in both delta-only and delta+vega studies.
-- Adding vega hedging reduces the final PnL standard deviation for both models.
-- The delta+vega strategy improves several central and moderate-tail metrics, but not every tail metric in every model, so the full loss distribution should be checked instead of relying on variance alone.
-- The hedging engine now records enough information to diagnose whether residual risk comes from curve exposure, volatility exposure, or cashflow/revaluation effects.
+- delta+vega hedging improves the mean PnL, standard deviation, and 95% VaR for both desk models relative to delta-only hedging on the same LMM paths
+- G2++ fits the outer market surface more closely than Hull-White, reflected in lower calibration RMSE
+- the HW and G2++ hedge outcomes are reasonably close under the LMM outer market, which is plausible because neither desk model is the true outer model
+- the experiment outputs enough diagnostics to separate calibration quality, residual curve risk, residual vega risk, and PnL decomposition effects
 
 ## Notes on Modeling Choices
 

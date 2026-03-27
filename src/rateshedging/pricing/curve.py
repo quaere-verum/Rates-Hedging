@@ -35,11 +35,18 @@ def _curve_nodes_from_zero_rates(zero_rates: ArrayLike, tenors: ArrayLike) -> tu
 
 
 def discount_from_zero_rates(zero_rates: ArrayLike, tenors: ArrayLike, query_times: ArrayLike) -> FloatArray:
-    node_times, log_discount_nodes = _curve_nodes_from_zero_rates(zero_rates, tenors)
+    rates = np.asarray(zero_rates, dtype=np.float64)
+    tenor_array = np.asarray(tenors, dtype=np.float64)
+    if tenor_array.ndim != 1:
+        raise ValueError("tenors must be a one-dimensional array.")
+    if rates.shape[-1] != tenor_array.size:
+        raise ValueError("The last dimension of zero_rates must match the size of tenors.")
+
     query = np.asarray(query_times, dtype=np.float64)
     if np.any(query < 0.0):
         raise ValueError("Query times must be non-negative.")
 
+    node_times = np.concatenate(([0.0], tenor_array))
     right_index = np.searchsorted(node_times, query, side="right")
     right_index = np.clip(right_index, 1, node_times.size - 1)
     left_index = right_index - 1
@@ -48,10 +55,27 @@ def discount_from_zero_rates(zero_rates: ArrayLike, tenors: ArrayLike, query_tim
     right_time = node_times[right_index]
     weight = (query - left_time) / (right_time - left_time)
 
-    left_values = np.take(log_discount_nodes, left_index, axis=-1)
-    right_values = np.take(log_discount_nodes, right_index, axis=-1)
-    interpolated = left_values + weight * (right_values - left_values)
-    return np.exp(interpolated)
+    base_log_discount_nodes = -rates * tenor_array
+    query_was_scalar = query.ndim == 0
+    right_index_1d = np.atleast_1d(right_index)
+    left_index_1d = np.atleast_1d(left_index)
+    weight_1d = np.atleast_1d(weight)
+
+    right_values = np.take(base_log_discount_nodes, right_index_1d - 1, axis=-1)
+    left_values = np.zeros_like(right_values, dtype=np.float64)
+    positive_left_mask = left_index_1d > 0
+    if np.any(positive_left_mask):
+        left_values[..., positive_left_mask] = np.take(
+            base_log_discount_nodes,
+            left_index_1d[positive_left_mask] - 1,
+            axis=-1,
+        )
+
+    interpolated = left_values + weight_1d * (right_values - left_values)
+    discounts = np.exp(interpolated)
+    if query_was_scalar:
+        return discounts[..., 0]
+    return discounts
 
 
 def forward_rates_from_zero_rates(

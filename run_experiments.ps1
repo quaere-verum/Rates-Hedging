@@ -6,9 +6,7 @@ Push-Location $repoRoot
 
 try {
     $experiments = @(
-        "experiments/bermudan_delta_pnl_breakdown.py",
-        "experiments/bermudan_delta_vega_pnl_breakdown.py",
-        "experiments/bermudan_model_misspecification_pnl_breakdown.py"
+        "experiments/lmm_outer_hedging_comparison.py"
     )
     $totalStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 

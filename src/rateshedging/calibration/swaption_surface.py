@@ -201,6 +201,7 @@ def apply_curve_surface_adjustment(
     reference_curve: CurveSnapshot,
     expiries: ArrayLike,
     swap_tenors: ArrayLike,
+    market_factors: ArrayLike | None = None,
 ) -> FloatArray:
     base_vols = np.asarray(base_normal_volatilities, dtype=np.float64)
     expiry_profile = np.asarray(expiries, dtype=np.float64)
@@ -213,13 +214,29 @@ def apply_curve_surface_adjustment(
         (curve_snapshot.zero_rates[-1] - curve_snapshot.zero_rates[0])
         - (reference_curve.zero_rates[-1] - reference_curve.zero_rates[0])
     )
-    level_scale = np.clip(1.0 + 6.0 * level_shift, 0.70, 1.30)
+    level_scale = np.clip(1.0 + 3.0 * level_shift, 0.82, 1.18)
 
     expiry_centered = expiry_profile / np.mean(expiry_profile) - 1.0
     tenor_centered = tenor_profile / np.mean(tenor_profile) - 1.0
-    twist = 1.0 + 1.5 * slope_shift * (expiry_centered[:, None] - tenor_centered[None, :])
+    twist = 1.0 + 0.5 * slope_shift * (expiry_centered[:, None] - tenor_centered[None, :])
+    factor_level = 1.0
+    factor_shape = 1.0
+    if market_factors is not None:
+        factor_array = np.asarray(market_factors, dtype=np.float64)
+        if factor_array.ndim != 1 or factor_array.size == 0:
+            raise ValueError("market_factors must be a one-dimensional array when provided.")
+        factor_level = np.clip(1.0 + 0.045 * np.tanh(0.90 * factor_array[0]), 0.86, 1.14)
+        if factor_array.size > 1:
+            factor_shape = np.clip(
+                1.0
+                + 0.050
+                * np.tanh(0.80 * factor_array[1])
+                * (1.35 * expiry_centered[:, None] - 0.95 * tenor_centered[None, :]),
+                0.82,
+                1.18,
+            )
 
-    return base_vols * np.clip(level_scale * twist, 0.60, 1.40)
+    return base_vols * np.clip(level_scale * twist * factor_level * factor_shape, 0.60, 1.40)
 
 
 def build_surface_paths(
@@ -230,6 +247,7 @@ def build_surface_paths(
     expiries: ArrayLike,
     swap_tenors: ArrayLike,
     base_normal_volatilities: ArrayLike,
+    factor_paths: ArrayLike | None = None,
 ) -> SwaptionSurfacePaths:
     time_array = validate_time_grid(time_grid)
     tenor_array = as_1d_float_array(curve_tenors, "curve_tenors")
@@ -239,6 +257,13 @@ def build_surface_paths(
     expected_shape = (curve_paths_array.shape[0], time_array.size, tenor_array.size)
     if curve_paths_array.shape != expected_shape:
         raise ValueError("curve_paths must have shape (n_paths, n_times, n_curve_tenors).")
+    factor_paths_array = None
+    if factor_paths is not None:
+        factor_paths_array = np.asarray(factor_paths, dtype=np.float64)
+        if factor_paths_array.ndim != 3:
+            raise ValueError("factor_paths must be a three-dimensional array when provided.")
+        if factor_paths_array.shape[:2] != curve_paths_array.shape[:2]:
+            raise ValueError("factor_paths must match the path and time dimensions of curve_paths.")
 
     expiries_array = as_1d_float_array(expiries, "expiries")
     swap_tenors_array = as_1d_float_array(swap_tenors, "swap_tenors")
@@ -260,6 +285,7 @@ def build_surface_paths(
                 reference_curve,
                 expiries_array,
                 swap_tenors_array,
+                None if factor_paths_array is None else factor_paths_array[path_index, time_index],
             )
 
     return SwaptionSurfacePaths(

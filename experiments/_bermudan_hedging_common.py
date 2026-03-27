@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 import sys
 
@@ -21,6 +21,7 @@ from rateshedging.instruments.bermudan_swaption import BermudanSwaption
 from rateshedging.instruments.instrument import InterestRateInstrument
 from rateshedging.instruments.swap import Swap
 from rateshedging.instruments.swaption import Swaption
+from rateshedging.models.libor_market_model import LIBORMarketModel
 from rateshedging.models.model import InterestRateModel, RatePaths
 from rateshedging.pricing.curve import CurveSnapshot
 from rateshedging.pricing.engine import MonteCarloPricingEngine
@@ -46,9 +47,17 @@ class ExperimentConfig:
     surface_expiries: FloatArray
     surface_swap_tenors: FloatArray
     n_outer_paths: int = 100
-    n_inner_paths: int = 10_000
+    n_inner_paths: int = 1_000
     curve_bump_size: float = 1.0e-4
     ridge_penalty: float = 1.0e6
+    lmm_tenor_spacing: float = 0.5
+    lmm_seed: int = 303
+    lmm_factor_volatilities: FloatArray = field(
+        default_factory=lambda: np.array([0.18, 0.10, 0.05], dtype=np.float64)
+    )
+    lmm_factor_decay_rates: FloatArray = field(
+        default_factory=lambda: np.array([0.0, 0.35, 1.10], dtype=np.float64)
+    )
     hw_seed: int = 101
     g2_seed: int = 202
     pricing_seed_hw: int = 17
@@ -71,16 +80,16 @@ class Scenario:
 
 
 def default_config() -> ExperimentConfig:
-    curve_times = np.linspace(0.0, 10.0, 201, dtype=np.float64)
+    curve_times = np.linspace(0.0, 20.0, 401, dtype=np.float64)
     base_zero_rates = 0.015 + 0.006 * (1.0 - np.exp(-0.45 * curve_times)) + 0.0004 * curve_times
     discount_factors = np.exp(-base_zero_rates * curve_times)
     return ExperimentConfig(
-        time_grid=np.arange(0.0, 4.0 + 0.5, 0.5, dtype=np.float64),
-        yield_curve_tenors=np.array([0.5, 1.0, 2.0, 5.0, 10.0], dtype=np.float64),
+        time_grid=np.arange(0.0, 5.0 + 0.5, 0.5, dtype=np.float64),
+        yield_curve_tenors=np.array([0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 15.0], dtype=np.float64),
         curve_times=curve_times,
         discount_factors=discount_factors,
-        surface_expiries=np.array([1.0, 2.0, 3.0], dtype=np.float64),
-        surface_swap_tenors=np.array([2.0, 4.0, 6.0], dtype=np.float64),
+        surface_expiries=np.array([1.0, 2.0, 3.0, 5.0], dtype=np.float64),
+        surface_swap_tenors=np.array([2.0, 5.0, 10.0, 15.0], dtype=np.float64),
     )
 
 
@@ -103,8 +112,8 @@ def build_target_and_hedges(
     base_zero_rates = _base_zero_rates(config)
 
     target_template = Swap(
-        start_time=1.0,
-        payment_times=_payment_grid(1.0, 7.0),
+        start_time=2.0,
+        payment_times=_payment_grid(2.0, 15.0),
         fixed_rate=0.0,
         notional=1_000_000.0,
         pay_fixed=True,
@@ -114,16 +123,16 @@ def build_target_and_hedges(
     )
     bermudan = BermudanSwaption(
         underlying_swap=Swap(
-            start_time=1.0,
-            payment_times=_payment_grid(1.0, 7.0),
+            start_time=2.0,
+            payment_times=_payment_grid(2.0, 15.0),
             fixed_rate=target_fixed_rate + 0.0025,
             notional=1_000_000.0,
             pay_fixed=True,
         ),
-        exercise_times=np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float64),
+        exercise_times=np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64),
     )
 
-    delta_swap_maturities = (2.0, 4.0, 6.0, 8.0)
+    delta_swap_maturities = (2.0, 4.0, 6.0, 8.0, 12.0, 15.0)
     delta_hedges: list[Swap] = []
     for maturity_time in delta_swap_maturities:
         template = Swap(
@@ -146,12 +155,17 @@ def build_target_and_hedges(
             )
         )
 
-    vega_expiries = (1.0, 2.0, 3.0)
+    vega_specifications = (
+        (1.0, 4.0),
+        (2.0, 5.0),
+        (3.0, 7.0),
+        (5.0, 10.0),
+    )
     vega_hedges: list[Swaption] = []
-    for expiry in vega_expiries:
+    for expiry, swap_tenor in vega_specifications:
         template_swap = Swap(
             start_time=expiry,
-            payment_times=_payment_grid(expiry, expiry + 4.0),
+            payment_times=_payment_grid(expiry, expiry + swap_tenor),
             fixed_rate=0.0,
             notional=1_000_000.0,
             pay_fixed=True,
@@ -163,7 +177,7 @@ def build_target_and_hedges(
             Swaption(
                 underlying_swap=Swap(
                     start_time=expiry,
-                    payment_times=_payment_grid(expiry, expiry + 4.0),
+                    payment_times=_payment_grid(expiry, expiry + swap_tenor),
                     fixed_rate=fair_rate,
                     notional=1_000_000.0,
                     pay_fixed=True,
@@ -191,39 +205,35 @@ def _surface_template(config: ExperimentConfig) -> SwaptionSurfaceSnapshot:
     )
 
 
-def _surface_from_adapter(
-    adapter: InterestRateModelAdapter,
-    config: ExperimentConfig,
-) -> SwaptionSurfaceSnapshot:
+def _stylized_market_surface(config: ExperimentConfig) -> SwaptionSurfaceSnapshot:
     template = _surface_template(config)
+    anchor_adapter = G2PPModelAdapter(
+        mean_reversion_x=0.15,
+        mean_reversion_y=0.03,
+        volatility_x=0.0105,
+        volatility_y=0.0070,
+        correlation=-0.70,
+    )
     return SwaptionSurfaceSnapshot(
-        expiries=template.expiries,
-        swap_tenors=template.swap_tenors,
-        normal_volatilities=adapter.surface_normal_volatilities(template),
+        expiries=config.surface_expiries,
+        swap_tenors=config.surface_swap_tenors,
+        normal_volatilities=anchor_adapter.surface_normal_volatilities(template),
         weights=template.weights,
     )
 
 
-def _hull_white_truth_adapter(config: ExperimentConfig) -> HullWhiteModelAdapter:
-    return HullWhiteModelAdapter(
-        mean_reversion=0.08,
-        volatility=0.01,
-        seed=config.pricing_seed_hw,
-        volatility_bump=5.0e-4,
+def _build_lmm_loading_matrix(config: ExperimentConfig) -> FloatArray:
+    terminal_horizon = float(config.time_grid[-1] + config.yield_curve_tenors[-1])
+    tenor_dates = np.arange(
+        config.lmm_tenor_spacing,
+        terminal_horizon + 1.0e-12,
+        config.lmm_tenor_spacing,
+        dtype=np.float64,
     )
-
-
-def _g2pp_truth_adapter(config: ExperimentConfig) -> G2PPModelAdapter:
-    return G2PPModelAdapter(
-        mean_reversion_x=0.15,
-        mean_reversion_y=0.03,
-        volatility_x=0.010,
-        volatility_y=0.006,
-        correlation=-0.70,
-        seed=config.pricing_seed_g2,
-        volatility_x_bump=5.0e-4,
-        volatility_y_bump=5.0e-4,
-    )
+    maturity_profile = tenor_dates / terminal_horizon
+    level_factor = 0.18 * np.exp(-0.08 * tenor_dates)
+    slope_factor = 0.30 * (maturity_profile - 0.42) * np.exp(-0.03 * tenor_dates)
+    return np.column_stack([level_factor, slope_factor])
 
 
 def _hull_white_initial_guess_adapter(config: ExperimentConfig) -> HullWhiteModelAdapter:
@@ -272,97 +282,54 @@ def _calibrated_g2pp_adapter(
     return calibration.adapter
 
 
-def _outer_model_from_adapter(
-    adapter: InterestRateModelAdapter,
-    outer_seed: int,
-    config: ExperimentConfig,
-) -> InterestRateModel:
-    outer_adapter = replace(adapter, seed=outer_seed)
-    return outer_adapter.build(
-        0.0,
-        config.time_grid,
-        config.curve_times,
-        config.discount_factors,
-        config.yield_curve_tenors,
-    )
-
-
-def _surface_paths_from_adapter(
+def _surface_paths_from_market(
     config: ExperimentConfig,
     outer_paths: RatePaths,
-    adapter: InterestRateModelAdapter,
+    market_surface: SwaptionSurfaceSnapshot,
 ) -> SwaptionSurfacePaths:
-    base_surface = _surface_from_adapter(adapter, config)
     return build_surface_paths(
         time_grid=config.time_grid,
         curve_paths=outer_paths.yield_curve_paths,
         curve_tenors=config.yield_curve_tenors,
         expiries=config.surface_expiries,
         swap_tenors=config.surface_swap_tenors,
-        base_normal_volatilities=base_surface.normal_volatilities,
+        base_normal_volatilities=market_surface.normal_volatilities,
+        factor_paths=outer_paths.yield_curve_factors,
     )
 
 
-def build_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
-    hull_white_market_adapter = _calibrated_hull_white_adapter(
-        config,
-        market_surface=_surface_from_adapter(_hull_white_truth_adapter(config), config),
+def build_lmm_market_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
+    market_surface = _stylized_market_surface(config)
+    hull_white_market_adapter = _calibrated_hull_white_adapter(config, market_surface=market_surface)
+    g2pp_market_adapter = _calibrated_g2pp_adapter(config, market_surface=market_surface)
+    outer_model = LIBORMarketModel(
+        tenor_spacing=config.lmm_tenor_spacing,
+        factor_loading_matrix=_build_lmm_loading_matrix(config),
+        time_grid=config.time_grid,
+        curve_times=config.curve_times,
+        discount_factors=config.discount_factors,
+        yield_curve_tenors=config.yield_curve_tenors,
+        seed=config.lmm_seed,
     )
-    g2pp_market_adapter = _calibrated_g2pp_adapter(
-        config,
-        market_surface=_surface_from_adapter(_g2pp_truth_adapter(config), config),
-    )
-    hull_white_outer = _outer_model_from_adapter(hull_white_market_adapter, config.hw_seed, config)
-    g2pp_outer = _outer_model_from_adapter(g2pp_market_adapter, config.g2_seed, config)
-    hull_white_outer_paths = hull_white_outer.generate_paths(config.n_outer_paths)
-    g2pp_outer_paths = g2pp_outer.generate_paths(config.n_outer_paths)
-    hull_white_surface_paths = _surface_paths_from_adapter(config, hull_white_outer_paths, hull_white_market_adapter)
-    g2pp_surface_paths = _surface_paths_from_adapter(config, g2pp_outer_paths, g2pp_market_adapter)
+    shared_outer_paths = outer_model.generate_paths(config.n_outer_paths)
+    shared_surface_paths = _surface_paths_from_market(config, shared_outer_paths, market_surface)
 
     return (
         Scenario(
             label="Hull-White",
             model_adapter=hull_white_market_adapter,
-            outer_paths=hull_white_outer_paths,
-            outer_surface_paths=hull_white_surface_paths,
+            outer_paths=shared_outer_paths,
+            outer_surface_paths=shared_surface_paths,
             pricing_model="Hull-White",
-            real_dynamics="Hull-White",
+            real_dynamics="LMM",
         ),
         Scenario(
             label="G2++",
             model_adapter=g2pp_market_adapter,
-            outer_paths=g2pp_outer_paths,
-            outer_surface_paths=g2pp_surface_paths,
-            pricing_model="G2++",
-            real_dynamics="G2++",
-        ),
-    )
-
-
-def build_g2pp_misspecification_scenarios(config: ExperimentConfig) -> tuple[Scenario, ...]:
-    g2pp_market_surface = _surface_from_adapter(_g2pp_truth_adapter(config), config)
-    g2pp_market_adapter = _calibrated_g2pp_adapter(config, market_surface=g2pp_market_surface)
-    hull_white_market_adapter = _calibrated_hull_white_adapter(config, market_surface=g2pp_market_surface)
-    g2pp_outer = _outer_model_from_adapter(g2pp_market_adapter, config.g2_seed, config)
-    shared_outer_paths = g2pp_outer.generate_paths(config.n_outer_paths)
-    shared_surface_paths = _surface_paths_from_adapter(config, shared_outer_paths, g2pp_market_adapter)
-
-    return (
-        Scenario(
-            label="HW Pricing / G2++ Dynamics",
-            model_adapter=hull_white_market_adapter,
-            outer_paths=shared_outer_paths,
-            outer_surface_paths=shared_surface_paths,
-            pricing_model="Hull-White",
-            real_dynamics="G2++",
-        ),
-        Scenario(
-            label="G2++ Pricing / G2++ Dynamics",
-            model_adapter=g2pp_market_adapter,
             outer_paths=shared_outer_paths,
             outer_surface_paths=shared_surface_paths,
             pricing_model="G2++",
-            real_dynamics="G2++",
+            real_dynamics="LMM",
         ),
     )
 
@@ -379,15 +346,15 @@ def _loss_cvar(values: FloatArray, confidence: float) -> float:
 
 def summarize_risk_metrics(path_summary: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str]] = []
-    metadata_columns = [column for column in ("pricing_model", "real_dynamics") if column in path_summary.columns]
-    for model_label in sorted(path_summary["model"].unique()):
-        model_rows = path_summary[path_summary["model"] == model_label]
-        metadata = {column: str(model_rows[column].iloc[0]) for column in metadata_columns}
+    group_columns = [column for column in ("strategy", "model", "pricing_model", "real_dynamics") if column in path_summary.columns]
+    for group_key, group_rows in path_summary.groupby(group_columns, sort=True):
+        if not isinstance(group_key, tuple):
+            group_key = (group_key,)
+        metadata = {column: value for column, value in zip(group_columns, group_key, strict=True)}
         for quantity in RISK_QUANTITIES:
-            values = model_rows[quantity].to_numpy(dtype=np.float64)
+            values = group_rows[quantity].to_numpy(dtype=np.float64)
             rows.append(
                 {
-                    "model": model_label,
                     **metadata,
                     "quantity": quantity,
                     "mean": float(np.mean(values)),
@@ -498,7 +465,7 @@ def run_experiment(
     path_rows: list[dict[str, float | str | int]] = []
     time_rows: list[dict[str, float | str | int]] = []
 
-    for scenario in scenarios or build_scenarios(config):
+    for scenario in scenarios or build_lmm_market_scenarios(config):
         engine = DynamicHedgingEngine(
             pricing_engine=MonteCarloPricingEngine(n_paths=config.n_inner_paths),
             model_adapter=scenario.model_adapter,
@@ -634,12 +601,37 @@ def make_plot(
     figure.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(figure)
 
+def run_strategy_suite(
+    *,
+    config: ExperimentConfig,
+    scenarios: tuple[Scenario, ...] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    shared_scenarios = scenarios or build_lmm_market_scenarios(config)
+    all_path_rows: list[pd.DataFrame] = []
+    all_time_rows: list[pd.DataFrame] = []
+    for strategy_label, include_vega in (("Delta", False), ("Delta + Vega", True)):
+        path_summary, time_summary, _ = run_experiment(
+            config=config,
+            strategy_label=strategy_label,
+            include_vega=include_vega,
+            scenarios=shared_scenarios,
+        )
+        all_path_rows.append(path_summary)
+        all_time_rows.append(time_summary)
+    combined_paths = pd.concat(all_path_rows, ignore_index=True)
+    combined_time = pd.concat(all_time_rows, ignore_index=True)
+    combined_risk = summarize_risk_metrics(combined_paths)
+    return combined_paths, combined_time, combined_risk
+
+
 __all__ = [
     "ExperimentConfig",
     "Scenario",
+    "build_lmm_market_scenarios",
     "build_target_and_hedges",
-    "build_g2pp_misspecification_scenarios",
     "default_config",
     "make_plot",
     "run_experiment",
+    "run_strategy_suite",
+    "summarize_risk_metrics",
 ]

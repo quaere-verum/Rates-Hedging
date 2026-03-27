@@ -167,6 +167,9 @@ class DynamicHedgingEngine:
             elif active_model_adapter is not None and n_calibration_parameters > 0:
                 calibrated_parameters[time_index] = active_model_adapter.calibration_parameter_values
 
+            all_instruments: list[InterestRateInstrument] = [target_instrument, *hedging_instruments]
+            all_active_flags = np.concatenate(([target_active], hedge_active)).astype(bool)
+
             target_swap_cashflow = 0.0
             hedge_swap_cashflows = np.zeros(n_hedges, dtype=np.float64)
             if time_index > 0:
@@ -200,33 +203,17 @@ class DynamicHedgingEngine:
                 hedge_cashflow_pnl[time_index] = -float(previous_weights @ hedge_swap_cashflows)
                 cash += hedge_cashflow_pnl[time_index]
 
-            provisional_target_value = self._mark_to_market(
-                target_instrument,
+            provisional_values = self._mark_to_market_batch(
+                all_instruments,
+                all_active_flags,
                 current_curve,
                 curve_path[time_index],
                 tenors,
                 valuation_time,
-                target_active,
                 active_model_adapter,
             )
-            if n_hedges == 0:
-                provisional_hedge_values = np.zeros(0, dtype=np.float64)
-            else:
-                provisional_hedge_values = np.asarray(
-                    [
-                        self._mark_to_market(
-                            hedge_instrument,
-                            current_curve,
-                            curve_path[time_index],
-                            tenors,
-                            valuation_time,
-                            active,
-                            active_model_adapter,
-                        )
-                        for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
-                    ],
-                    dtype=np.float64,
-                )
+            provisional_target_value = float(provisional_values[0])
+            provisional_hedge_values = provisional_values[1:]
 
             target_option_settlement = 0.0
             if target_active:
@@ -281,59 +268,28 @@ class DynamicHedgingEngine:
             ):
                 raise RuntimeError("PnL decomposition identity failed during hedging.")
 
-            target_sensitivities = self._instrument_curve_sensitivities(
-                target_instrument,
+            all_curve_sensitivities = self._instrument_curve_sensitivities_batch(
+                all_instruments,
+                all_active_flags,
                 curve_path[time_index],
                 tenors,
                 valuation_time,
-                target_active,
                 active_model_adapter,
             )
-            if n_hedges == 0:
-                hedge_sensitivities = np.zeros((0, tenors.size), dtype=np.float64)
-            else:
-                hedge_sensitivities = np.asarray(
-                    [
-                        self._instrument_curve_sensitivities(
-                            hedge_instrument,
-                            curve_path[time_index],
-                            tenors,
-                            valuation_time,
-                            bool(active),
-                            active_model_adapter,
-                        )
-                        for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
-                    ],
-                    dtype=np.float64,
-                )
+            target_sensitivities = all_curve_sensitivities[0]
+            hedge_sensitivities = all_curve_sensitivities[1:]
 
-            target_vegas = self._instrument_vega_sensitivities(
-                target_instrument,
+            all_vegas = self._instrument_vega_sensitivities_batch(
+                all_instruments,
+                all_active_flags,
                 curve_path[time_index],
                 tenors,
                 valuation_time,
-                target_active,
                 vega_parameters,
                 active_model_adapter,
             )
-            if n_hedges == 0:
-                hedge_vegas = np.zeros((0, n_vega), dtype=np.float64)
-            else:
-                hedge_vegas = np.asarray(
-                    [
-                        self._instrument_vega_sensitivities(
-                            hedge_instrument,
-                            curve_path[time_index],
-                            tenors,
-                            valuation_time,
-                            bool(active),
-                            vega_parameters,
-                            active_model_adapter,
-                        )
-                        for hedge_instrument, active in zip(hedging_instruments, hedge_active, strict=True)
-                    ],
-                    dtype=np.float64,
-                )
+            target_vegas = all_vegas[0]
+            hedge_vegas = all_vegas[1:]
 
             new_weights = self._solve_hedge_weights(
                 target_curve_sensitivities=target_sensitivities,
@@ -441,6 +397,39 @@ class DynamicHedgingEngine:
             )
         return self._instrument_value(instrument, curve, valuation_time, model, True)
 
+    def _mark_to_market_batch(
+        self,
+        instruments: Sequence[InterestRateInstrument],
+        active_flags: Sequence[bool],
+        curve: CurveSnapshot,
+        zero_rates: FloatArray,
+        curve_tenors: FloatArray,
+        valuation_time: float,
+        model_adapter: InterestRateModelAdapter | None,
+    ) -> FloatArray:
+        values = np.zeros(len(instruments), dtype=np.float64)
+        active_optional_instruments = [
+            instrument
+            for instrument, is_active in zip(instruments, active_flags, strict=True)
+            if is_active and not isinstance(instrument, Swap)
+        ]
+        local_time_grid = self._required_time_grid(active_optional_instruments, valuation_time)
+        model = None
+        if local_time_grid is not None:
+            model = self._build_model_from_inputs(
+                model_adapter,
+                valuation_time,
+                local_time_grid,
+                curve_tenors,
+                zero_rates_to_discount_factors(zero_rates, curve_tenors),
+            )
+
+        for instrument_index, (instrument, is_active) in enumerate(zip(instruments, active_flags, strict=True)):
+            if not is_active:
+                continue
+            values[instrument_index] = self._instrument_value(instrument, curve, valuation_time, model, True)
+        return values
+
     def _required_time_grid(
         self,
         instruments: Sequence[InterestRateInstrument],
@@ -518,7 +507,7 @@ class DynamicHedgingEngine:
         if isinstance(instrument, Swaption):
             if valuation_time > instrument.expiry + 1.0e-12:
                 return 0.0
-            if np.isclose(valuation_time, instrument.expiry, atol=1.0e-12, rtol=0.0):
+            if abs(valuation_time - instrument.expiry) <= 1.0e-12:
                 return float(
                     instrument.direction
                     * instrument.exercise_value_from_zero_rates(curve.zero_rates, curve.tenors)
@@ -527,7 +516,11 @@ class DynamicHedgingEngine:
             return 0.0
         if model is None:
             if isinstance(instrument, BermudanSwaption):
-                exercise_today = np.any(np.isclose(instrument.exercise_times, valuation_time, atol=1.0e-12, rtol=0.0))
+                exercise_index = int(np.searchsorted(instrument.exercise_times, valuation_time))
+                exercise_today = (
+                    exercise_index < instrument.exercise_times.size
+                    and abs(float(instrument.exercise_times[exercise_index]) - valuation_time) <= 1.0e-12
+                )
                 if exercise_today:
                     return float(
                         instrument.direction
@@ -550,7 +543,7 @@ class DynamicHedgingEngine:
         if isinstance(instrument, Swaption):
             if valuation_time < instrument.expiry - 1.0e-12:
                 return 0.0, True
-            if np.isclose(valuation_time, instrument.expiry, atol=1.0e-12, rtol=0.0):
+            if abs(valuation_time - instrument.expiry) <= 1.0e-12:
                 intrinsic = float(
                     instrument.exercise_value_from_zero_rates(curve.zero_rates, curve.tenors)
                 )
@@ -559,7 +552,11 @@ class DynamicHedgingEngine:
 
         if valuation_time > instrument.exercise_times[-1] + 1.0e-12:
             return 0.0, False
-        if not np.any(np.isclose(instrument.exercise_times, valuation_time, atol=1.0e-12, rtol=0.0)):
+        exercise_index = int(np.searchsorted(instrument.exercise_times, valuation_time))
+        if (
+            exercise_index >= instrument.exercise_times.size
+            or abs(float(instrument.exercise_times[exercise_index]) - valuation_time) > 1.0e-12
+        ):
             return 0.0, True
 
         intrinsic = float(
@@ -632,6 +629,80 @@ class DynamicHedgingEngine:
 
         return sensitivities
 
+    def _instrument_curve_sensitivities_batch(
+        self,
+        instruments: Sequence[InterestRateInstrument],
+        active_flags: Sequence[bool],
+        zero_rates: FloatArray,
+        curve_tenors: FloatArray,
+        valuation_time: float,
+        model_adapter: InterestRateModelAdapter | None,
+    ) -> FloatArray:
+        n_instruments = len(instruments)
+        sensitivities = np.zeros((n_instruments, curve_tenors.size), dtype=np.float64)
+
+        active_optional_instruments = [
+            instrument
+            for instrument, is_active in zip(instruments, active_flags, strict=True)
+            if is_active and not isinstance(instrument, Swap)
+        ]
+        local_time_grid = self._required_time_grid(active_optional_instruments, valuation_time)
+
+        for instrument_index, (instrument, is_active) in enumerate(zip(instruments, active_flags, strict=True)):
+            if not is_active:
+                continue
+            if isinstance(instrument, Swap):
+                bump_matrix = np.eye(curve_tenors.size, dtype=np.float64) * self.curve_bump_size
+                value_up = instrument.present_value_from_zero_rates(
+                    zero_rates[None, :] + bump_matrix,
+                    curve_tenors,
+                    valuation_time,
+                )
+                value_down = instrument.present_value_from_zero_rates(
+                    zero_rates[None, :] - bump_matrix,
+                    curve_tenors,
+                    valuation_time,
+                )
+                sensitivities[instrument_index] = (value_up - value_down) / (2.0 * self.curve_bump_size)
+
+        if local_time_grid is None:
+            return sensitivities
+
+        optional_indices = [
+            index
+            for index, (instrument, is_active) in enumerate(zip(instruments, active_flags, strict=True))
+            if is_active and not isinstance(instrument, Swap)
+        ]
+        for tenor_index in range(curve_tenors.size):
+            bumped_up = zero_rates.copy()
+            bumped_down = zero_rates.copy()
+            bumped_up[tenor_index] += self.curve_bump_size
+            bumped_down[tenor_index] -= self.curve_bump_size
+
+            curve_up = CurveSnapshot.from_zero_rates(curve_tenors, bumped_up)
+            curve_down = CurveSnapshot.from_zero_rates(curve_tenors, bumped_down)
+            model_up = self._build_model_from_inputs(
+                model_adapter,
+                valuation_time,
+                local_time_grid,
+                curve_tenors,
+                zero_rates_to_discount_factors(bumped_up, curve_tenors),
+            )
+            model_down = self._build_model_from_inputs(
+                model_adapter,
+                valuation_time,
+                local_time_grid,
+                curve_tenors,
+                zero_rates_to_discount_factors(bumped_down, curve_tenors),
+            )
+            for instrument_index in optional_indices:
+                instrument = instruments[instrument_index]
+                value_up = self._instrument_value(instrument, curve_up, valuation_time, model_up, True)
+                value_down = self._instrument_value(instrument, curve_down, valuation_time, model_down, True)
+                sensitivities[instrument_index, tenor_index] = (value_up - value_down) / (2.0 * self.curve_bump_size)
+
+        return sensitivities
+
     def _instrument_vega_sensitivities(
         self,
         instrument: InterestRateInstrument,
@@ -676,6 +747,64 @@ class DynamicHedgingEngine:
             value_up = self._instrument_value(instrument, curve, valuation_time, model_up, True)
             value_down = self._instrument_value(instrument, curve, valuation_time, model_down, True)
             vegas[parameter_index] = (value_up - value_down) / (2.0 * parameter.bump_size)
+        return vegas
+
+    def _instrument_vega_sensitivities_batch(
+        self,
+        instruments: Sequence[InterestRateInstrument],
+        active_flags: Sequence[bool],
+        zero_rates: FloatArray,
+        curve_tenors: FloatArray,
+        valuation_time: float,
+        vega_parameters: tuple,
+        model_adapter: InterestRateModelAdapter | None,
+    ) -> FloatArray:
+        vegas = np.zeros((len(instruments), len(vega_parameters)), dtype=np.float64)
+        if len(vega_parameters) == 0:
+            return vegas
+
+        active_optional_instruments = [
+            instrument
+            for instrument, is_active in zip(instruments, active_flags, strict=True)
+            if is_active and not isinstance(instrument, Swap)
+        ]
+        local_time_grid = self._required_time_grid(active_optional_instruments, valuation_time)
+        if local_time_grid is None:
+            return vegas
+
+        curve = CurveSnapshot.from_zero_rates(curve_tenors, zero_rates)
+        discount_factors = zero_rates_to_discount_factors(zero_rates, curve_tenors)
+        optional_indices = [
+            index
+            for index, (instrument, is_active) in enumerate(zip(instruments, active_flags, strict=True))
+            if is_active and not isinstance(instrument, Swap)
+        ]
+
+        for parameter_index, parameter in enumerate(vega_parameters):
+            model_up = self._build_bumped_model(
+                model_adapter,
+                parameter.name,
+                parameter.bump_size,
+                valuation_time,
+                local_time_grid,
+                curve_tenors,
+                discount_factors,
+            )
+            model_down = self._build_bumped_model(
+                model_adapter,
+                parameter.name,
+                -parameter.bump_size,
+                valuation_time,
+                local_time_grid,
+                curve_tenors,
+                discount_factors,
+            )
+            for instrument_index in optional_indices:
+                instrument = instruments[instrument_index]
+                value_up = self._instrument_value(instrument, curve, valuation_time, model_up, True)
+                value_down = self._instrument_value(instrument, curve, valuation_time, model_down, True)
+                vegas[instrument_index, parameter_index] = (value_up - value_down) / (2.0 * parameter.bump_size)
+
         return vegas
 
     @staticmethod
@@ -728,8 +857,8 @@ class DynamicHedgingEngine:
             strict=True,
         ):
             if not (
-                np.isclose(accrual_start, previous_time, atol=1.0e-12, rtol=0.0)
-                and np.isclose(payment_time, current_time, atol=1.0e-12, rtol=0.0)
+                abs(float(accrual_start) - previous_time) <= 1.0e-12
+                and abs(float(payment_time) - current_time) <= 1.0e-12
             ):
                 continue
 

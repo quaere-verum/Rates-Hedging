@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from rateshedging.models.g2pp import G2PPModel
 from rateshedging.models.hull_white import HullWhiteModel
+from rateshedging.models.libor_market_model import LIBORMarketModel
 
 
 class GaussianModelPathGenerationTests(unittest.TestCase):
@@ -68,6 +69,30 @@ class GaussianModelPathGenerationTests(unittest.TestCase):
             paths.stochastic_discount_factors.mean(axis=0),
             self.expected_discount_curve,
             atol=6.0e-4,
+        )
+
+    def test_lmm_paths_fit_initial_curve(self) -> None:
+        model = LIBORMarketModel(
+            tenor_spacing=0.125,
+            factor_volatilities=np.array([0.16, 0.08, 0.04], dtype=np.float64),
+            factor_decay_rates=np.array([0.0, 0.35, 1.10], dtype=np.float64),
+            time_grid=self.time_grid,
+            curve_times=self.curve_times,
+            discount_factors=self.discount_factors,
+            yield_curve_tenors=self.tenors,
+            seed=789,
+        )
+
+        paths = model.generate_paths(5_000)
+
+        self.assertEqual(paths.yield_curve_paths.shape, (5_000, self.time_grid.size, self.tenors.size))
+        self.assertEqual(paths.stochastic_discount_factors.shape, (5_000, self.time_grid.size))
+        self.assertEqual(paths.yield_curve_factors.shape, (5_000, self.time_grid.size, 3))
+        np.testing.assert_allclose(paths.yield_curve_paths[0, 0], self.expected_initial_yields, atol=1.0e-10)
+        np.testing.assert_allclose(
+            paths.stochastic_discount_factors.mean(axis=0),
+            self.expected_discount_curve,
+            atol=2.0e-3,
         )
 
 
