@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rates-hedging"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.8",
+    "numba>=0.64.0",
+    "pandas>=3.0.1",
+    "scipy>=1.17.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
